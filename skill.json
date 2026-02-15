@@ -1,0 +1,17 @@
+{
+  "name": "exercise-qa-4",
+  "version": "1.0.0",
+  "description": "Student simulation testing for Red Hat Training exercises",
+  "entry_point": {
+    "script": "src/main.py",
+    "type": "python3"
+  },
+  "invocation": {
+    "command": "/exercise-qa",
+    "patterns": [
+      "<lesson-code> <exercise-name>",
+      "<lesson-path> <exercise-name>",
+      "<epub-path> [exercise-name]"
+    ]
+  }
+}

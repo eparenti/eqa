@@ -1,0 +1,98 @@
+{
+  "course_code": "RH358",
+  "course_title": "Red Hat Services Management and Automation",
+  "course_repo": "git@github.com:RedHatTraining/RH358.git",
+  "course_repo_local": "/home/eparenti/git-repos/archive/RH-Courses/RH358",
+  "epub_path": "/home/eparenti/git-repos/archive/RH-Courses/RH358/RH358-RHEL9.4-en-1.epub",
+  "mapping_type": "multi_repo",
+  "mapping": {
+    "1": {
+      "chapter_number": 1,
+      "chapter_title": "Managing Network Services",
+      "keyword": "servicemgmt",
+      "lesson_code": "au0004l",
+      "lesson_repo": "git@github.com:RedHatTraining/AU0004L.git",
+      "lesson_repo_local": "/home/eparenti/git-repos/active/AU0004L",
+      "epub_chapter_file": "servicemgmt.xhtml",
+      "exercises": [
+        {
+          "id": "servicemgmt-netservice",
+          "type": "ge",
+          "name": "Controlling Network Services",
+          "has_materials": false,
+          "grading_script": "servicemgmt-netservice.py"
+        },
+        {
+          "id": "servicemgmt-netreview",
+          "type": "ge",
+          "name": "Configuring Network Interfaces",
+          "has_materials": false,
+          "grading_script": "servicemgmt-netreview.py"
+        },
+        {
+          "id": "servicemgmt-automation",
+          "type": "ge",
+          "name": "Automating Service and Network Interface Configuration",
+          "has_materials": true,
+          "grading_script": "servicemgmt-automation.py"
+        },
+        {
+          "id": "servicemgmt-review",
+          "type": "lab",
+          "name": "Managing Network Services",
+          "has_materials": true,
+          "has_grading": true,
+          "grading_script": "servicemgmt-review.py"
+        }
+      ]
+    },
+    "2": {
+      "chapter_number": 2,
+      "chapter_title": "Configuring Link Aggregation and Bridging",
+      "keyword": "netlink",
+      "lesson_code": "au0005l",
+      "lesson_repo": "git@github.com:RedHatTraining/AU0005L.git",
+      "lesson_repo_local": "/home/eparenti/git-repos/active/AU0005L",
+      "epub_chapter_file": "netlink.xhtml",
+      "exercises": [
+        {
+          "id": "netlink-bonding",
+          "type": "ge",
+          "name": "Configuring Network Teaming",
+          "has_materials": false,
+          "grading_script": "netlink-bonding.py"
+        },
+        {
+          "id": "netlink-bondmgmt",
+          "type": "ge",
+          "name": "Managing Network Teams",
+          "has_materials": false,
+          "grading_script": "netlink-bondmgmt.py"
+        },
+        {
+          "id": "netlink-automation",
+          "type": "ge",
+          "name": "Automating Network Team Configuration",
+          "has_materials": true,
+          "grading_script": "netlink-automation.py"
+        },
+        {
+          "id": "netlink-review",
+          "type": "lab",
+          "name": "Configuring Link Aggregation and Bridging",
+          "has_materials": true,
+          "has_grading": true,
+          "grading_script": "netlink-review.py"
+        }
+      ]
+    }
+  },
+  "notes": {
+    "pattern": "Multi-repo course structure",
+    "lesson_naming": "Each chapter is a separate AU00XXL repository",
+    "exercise_naming": "{keyword}-{topic}[-ge|-lab]",
+    "materials_pattern": "Not all GEs have materials directories - simpler exercises only have grading scripts",
+    "grading_detection": "Labs have grade() method in grading script",
+    "epub_structure": "EPUB chapter filenames match outline.yml keywords"
+  }
+}

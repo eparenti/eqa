@@ -1,0 +1,88 @@
+{
+  "name": "exercise-qa-3",
+  "version": "1.0.0",
+  "description": "Professional exercise QA automation for Red Hat Training courses",
+  "authors": [
+    "Ed Parenti <eparenti@redhat.com>"
+  ],
+  "license": "Proprietary",
+
+  "entry_point": {
+    "script": "src/main.py",
+    "type": "python3"
+  },
+
+  "invocation": {
+    "command": "/exercise-qa",
+    "patterns": [
+      {
+        "syntax": "<lesson-code> <exercise-name>",
+        "description": "Test single exercise",
+        "example": "/exercise-qa AU0024L scale-files"
+      },
+      {
+        "syntax": "/path/to/lesson",
+        "description": "Test all exercises in lesson",
+        "example": "/exercise-qa ~/git-repos/active/AU294-lessons/AU0024L"
+      },
+      {
+        "syntax": "/path/to/COURSE.epub",
+        "description": "Test all exercises in course",
+        "example": "/exercise-qa ~/git-repos/active/AU294/AU294.epub"
+      }
+    ]
+  },
+
+  "capabilities": {
+    "test_categories": [
+      "TC-PREREQ",
+      "TC-EXEC",
+      "TC-WORKFLOW",
+      "TC-SOL",
+      "TC-SOLVE",
+      "TC-VERIFY",
+      "TC-GRADE",
+      "TC-CLEAN",
+      "TC-IDEM",
+      "TC-AAP",
+      "TC-E2E",
+      "TC-SECURITY",
+      "TC-CONTRACT",
+      "TC-INSTRUCT",
+      "TC-LINT",
+      "TC-DEPS",
+      "TC-PERF",
+      "TC-VARS",
+      "TC-ROLLBACK",
+      "TC-NETWORK",
+      "TC-WEB",
+      "TC-DYNOLABS",
+      "TC-EE"
+    ],
+    "features": [
+      "SSH ControlMaster multiplexing for fast execution",
+      "Course profile analysis (reads EPUB before testing)",
+      "Solution execution on live systems",
+      "3-scenario grading validation (WITH/WITHOUT/message quality)",
+      "Automatic EPUB building (sk)",
+      "Multi-repo course support",
+      "Parallel test execution",
+      "Result caching",
+      "Quality metrics and scoring",
+      "Multi-format reporting (Markdown, JSON, JUnit XML, CSV)",
+      "Browser automation (Playwright)",
+      "DynoLabs v5 support (Rust CLI + Python)",
+      "Colorized terminal output",
+      "AI-powered error diagnostics",
+      "Network device timeout handling (Cisco, Juniper, Arista)",
+      "Execution environment validation",
+      "Standard/Full/E2E/CI testing modes",
+      "Auto lab package detection and installation",
+      "AAP Controller content awareness",
+      "Dev container support"
+    ]
+  },
+
+  "status": "production",
+  "maturity": "stable"
+}
