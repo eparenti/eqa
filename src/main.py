@@ -1,4 +1,4 @@
-"""exercise-qa-4: Student simulation testing for Red Hat Training exercises.
+"""eqa: Student simulation testing for Red Hat Training exercises.
 
 Usage:
     python3 -m src.main <input> [exercise]
@@ -49,7 +49,7 @@ DEFAULT_OUTPUT_DIR = Path(os.environ.get("EQA_CALLER_DIR", ".")) / "eqa-results"
 def main(args: Optional[List[str]] = None):
     """Main entry point."""
     parser = argparse.ArgumentParser(
-        prog="exercise-qa-4",
+        prog="eqa",
         description="Student simulation testing for Red Hat Training exercises",
     )
     parser.add_argument("input", help="EPUB path, lesson directory, or lesson code")

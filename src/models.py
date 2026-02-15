@@ -1,4 +1,4 @@
-"""Data models for exercise-qa-4."""
+"""Data models for eqa."""
 
 from dataclasses import dataclass, field
 from enum import Enum

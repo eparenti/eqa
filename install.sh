@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Install exercise-qa-4 (eqa) on the current system
+# Install eqa on the current system
 
 set -e
 
 EQA_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALL_DIR="${HOME}/.local/bin"
 
-echo "Installing exercise-qa-4..."
+echo "Installing eqa..."
 echo "  Source: $EQA_DIR"
 echo "  Install dir: $INSTALL_DIR"
 

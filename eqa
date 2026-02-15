@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# exercise-qa-4: Student simulation testing for Red Hat Training exercises
+# eqa: Student simulation testing for Red Hat Training exercises
 #
 # Usage:
 #   eqa AU0024L                      # test all exercises in a lesson

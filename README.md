@@ -1,4 +1,4 @@
-# exercise-qa-4: Automated Red Hat Training Exercise Testing
+# eqa: Automated Red Hat Training Exercise Testing
 
 Fully automated quality assurance testing for Red Hat Training exercises.
 
@@ -19,7 +19,7 @@ Fully automated quality assurance testing for Red Hat Training exercises.
 ### Quick Install
 
 ```bash
-cd /path/to/exercise-qa-4
+cd /path/to/eqa
 ./install.sh
 ```
 
@@ -31,10 +31,10 @@ This will:
 
 ```bash
 # Add to your PATH
-export PATH="/path/to/exercise-qa-4:$PATH"
+export PATH="/path/to/eqa:$PATH"
 
 # Or create symlink manually
-ln -s /path/to/exercise-qa-4/eqa ~/.local/bin/eqa
+ln -s /path/to/eqa/eqa ~/.local/bin/eqa
 ```
 
 ### Verify Installation
@@ -218,7 +218,7 @@ Average per cycle: 215.2s
 ## Architecture
 
 ```
-exercise-qa-4/
+eqa/
 ├── eqa                 # CLI entry point
 ├── install.sh          # Installation script
 ├── src/
@@ -255,7 +255,7 @@ export PATH="$HOME/.local/bin:$PATH"
 
 ### Running Without Install
 ```bash
-cd exercise-qa-4
+cd eqa
 python3 -m src.main AU0024L scale-files
 ```
 
