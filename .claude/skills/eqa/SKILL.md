@@ -1,0 +1,1 @@
+/home/eparenti/git-repos/eqa/SKILL.md
