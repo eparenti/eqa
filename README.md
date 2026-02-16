@@ -1,314 +1,81 @@
-# eqa: Automated Red Hat Training Exercise Testing
+# eqa: Exercise QA for Red Hat Training
 
-Fully automated quality assurance testing for Red Hat Training exercises.
+A Claude Code skill that automates quality assurance testing for Red Hat Training course exercises.
 
-## Features
+## What It Does
 
-- **Student Simulation** - Executes EPUB instructions on live lab systems
-- **Solution Testing** - Validates solution files work correctly
-- **Enhanced Grading** - Tests grading without/with solution
-- **Idempotency Testing** - Multi-cycle testing for reliability
-- **Bug Detection** - Auto-classifies bugs by severity (P0-P3)
-- **Dev Container Support** - Works with ansible-dev-tools containers
-- **Interactive Mode** - Prompts when lab environment isn't ready, gives you time to set it up
-- **Multiple Report Formats** - Markdown, JSON, JUnit
-- **Chapter-Level Testing** - Test by chapter number
-- **Course-Wide Testing** - Test all exercises at once
+- Tests exercises on live lab systems by simulating student workflows
+- Validates solution files, grading scripts, and cleanup
+- Detects bugs and classifies by severity (P0-P3)
+- Handles dev containers, multi-repo courses, interactive commands
+- Generates detailed QA reports
 
-## Installation
+## Usage
 
-### Quick Install
+This is a Claude Code skill. Invoke it with:
 
 ```bash
-cd /path/to/eqa
-./install.sh
-```
+# Test a single exercise
+/eqa AU0024L scale-files
 
-This will:
-1. Create a symlink in `~/.local/bin/eqa`
-2. Make the `eqa` command available system-wide
+# Test a chapter (multi-repo course)
+/eqa AU294 --chapter 6
 
-### Manual Install
-
-```bash
-# Add to your PATH
-export PATH="/path/to/eqa:$PATH"
-
-# Or create symlink manually
-ln -s /path/to/eqa/eqa ~/.local/bin/eqa
-```
-
-### Verify Installation
-
-```bash
-eqa --help
+# Test all exercises in a lesson
+/eqa AU0024L
 ```
 
 ## Requirements
 
-- Python 3.8+
-- SSH access to Red Hat Training workstation
-- SSH config with `workstation` host defined
-- Required Python packages: `beautifulsoup4`, `lxml`, `pyyaml`
-
-## Usage
-
-### Basic Testing
-
-```bash
-# Test a single exercise
-eqa AU0024L scale-files
-
-# Test all exercises in a lesson
-eqa AU0024L
-
-# Test specific chapter
-eqa AU294 --chapter 4
-```
-
-### Advanced Testing
-
-```bash
-# Idempotency testing (run 2 cycles)
-eqa AU0022L control-review --cycles 2
-
-# Solution file testing
-eqa AU0024L scale-review --test-solutions
-
-# Multiple report formats
-eqa AU0024L scale-files --format all
-
-# Custom output directory
-eqa AU0024L scale-files --output /tmp/qa-reports
-```
-
-### Interactive Mode
-
-When EQA can't connect to the lab workstation, it prompts you to retry, skip, or abort:
-
-```bash
-# Interactive mode (default) - prompts on connection failure
-eqa AU294 control-review
-
-# Prompt example:
-⚠️  Cannot connect to workstation: workstation
-
-Options:
-  [R] Retry - Try connecting again (I'm setting up the environment)
-  [S] Skip  - Skip this exercise and continue with the next one
-  [A] Abort - Stop all testing
-
-Your choice [R/s/a]:
-```
-
-**Use cases:**
-- Testing multiple exercises - start each lab environment as needed
-- Classroom testing - ephemeral lab environments
-- Development - test specific exercises while setting up infrastructure
-
-**Non-interactive mode** for CI/CD:
-
-```bash
-# Skips exercises on connection failure (no prompts)
-eqa AU294 --non-interactive
-```
-
-See [docs/interactive-mode.md](docs/interactive-mode.md) for detailed usage.
-
-### Command-Line Options
-
-```
-positional arguments:
-  input                 EPUB path, lesson directory, or lesson code
-  exercise             Exercise ID (optional, tests all if omitted)
-
-options:
-  --format {markdown,json,junit,all}
-                        Report format (default: markdown)
-  -o, --output PATH    Output directory (default: ./eqa-results)
-  --quiet              Suppress console output
-  --no-color           Disable ANSI colors
-  --cycles N           Number of cycles for idempotency testing (default: 1)
-  --test-solutions     Test solution files instead of student simulation
-  --chapter N          Test only chapter N (requires course code input)
-  --lesson-code CODE   Lesson code for multi-repo courses (e.g., au0020l)
-  --non-interactive    Skip exercises on connection failure instead of prompting
-  --mode {legacy,categories}
-                        Test mode (default: categories)
-  --rebuild-epub       Force EPUB rebuild
-  --timeout-lab SEC    Lab command timeout (default: 300)
-  --timeout-command SEC Command timeout (default: 120)
-  --timeout-build SEC  EPUB build timeout (default: 600)
-```
-
-## How It Works
-
-### Student Simulation Flow
-
-1. **Extract** - Parse EPUB to get exercise instructions
-2. **Connect** - SSH to workstation
-3. **Start** - Run `lab start <exercise>`
-4. **Simulate** - Execute EPUB instructions step-by-step
-5. **Grade** - Run `lab grade <exercise>` (for Labs)
-6. **Finish** - Run `lab finish <exercise>`
-7. **Verify** - Confirm cleanup worked (run `lab start` again)
-
-### Enhanced Grading (Labs Only)
-
-1. **Test WITHOUT solution** - Grading should fail
-2. **Execute instructions** - Simulate student work
-3. **Test WITH solution** - Grading should pass
-
-Detects bugs when:
-- Grading passes without solution (incorrect validation)
-- Grading fails with solution (broken grading script)
-
-### Idempotency Testing
-
-Run the complete cycle multiple times:
-
-```
-Cycle 1: lab start → simulate → grade → finish
-Cycle 2: lab start → simulate → grade → finish
-...
-Cycle N: lab start → simulate → grade → finish
-```
-
-Validates:
-- Scripts are truly idempotent
-- Cleanup is complete
-- No state pollution between runs
-
-## Reports
-
-Reports are written to `./eqa-results/` (or custom path via `--output`):
-
-### Single Exercise
-- `<exercise>-<timestamp>.md` - Detailed Markdown report
-- `<exercise>-<timestamp>.json` - JSON format
-- `<exercise>-<timestamp>.xml` - JUnit XML
-
-### Idempotency Testing
-- `<exercise>-<timestamp>.md` - Cycle 1 report
-- `<exercise>-cycle2-<timestamp>.md` - Cycle 2 report
-- `<exercise>-cycle3-<timestamp>.md` - Cycle 3 report
-
-### Multi-Exercise
-- `<COURSE>-summary.md` - Course-level summary
-
-## Bug Severity Levels
-
-| Level | Description | Examples |
-|-------|-------------|----------|
-| **P0** | Blocker - Exercise unusable | SSH fails, lab command missing |
-| **P1** | Critical - Validation broken | Grading fails, cleanup incomplete |
-| **P2** | High - Quality issues | Instruction steps fail |
-| **P3** | Low - Polish needed | Typos, style issues |
-
-## Examples
-
-### Test a GE (Guided Exercise)
-```bash
-eqa AU0022L control-flow
-```
-
-Output:
-```
-✓ Lab start successful
-✓ Instructions executed (6/6 passed)
-✓ Lab finish successful
-✓ Cleanup verified
-```
-
-### Test a Lab with Enhanced Grading
-```bash
-eqa AU0022L control-review
-```
-
-Output:
-```
-✓ Lab start successful
-✗ Grading WITHOUT solution: PASSED (expected FAIL) - BUG FOUND!
-✓ Instructions executed (4/4 passed)
-✓ Grading WITH solution: PASSED
-✓ Lab finish successful
-
-Bugs Found:
-[P1] Grading passed without solution (should fail)
-```
-
-### Idempotency Testing
-```bash
-eqa AU0022L control-review --cycles 3
-```
-
-Output:
-```
-Cycle 1/3: ✓ PASSED
-Cycle 2/3: ✓ PASSED
-Cycle 3/3: ✓ PASSED
-
-✓ IDEMPOTENT: All 3 cycles passed
-Average per cycle: 215.2s
-```
+- Claude Code CLI
+- Python 3.8+ with `beautifulsoup4`, `lxml`, `pyyaml`
+- SSH access to Red Hat Training workstation (`~/.ssh/config` with `workstation` host)
+- `pexpect` for interactive commands (optional)
 
 ## Architecture
 
+Claude orchestrates the testing workflow, calling Python utilities for mechanical tasks:
+
 ```
 eqa/
-├── eqa                 # CLI entry point
-├── install.sh          # Installation script
-├── src/
-│   ├── main.py        # Argument parsing, orchestration
-│   ├── runner.py      # Student simulation engine
-│   ├── epub.py        # EPUB parsing, instruction extraction
-│   ├── ssh.py         # SSH connection, command execution
-│   ├── models.py      # Data models
-│   └── report.py      # Report generation
-└── README.md          # This file
+├── SKILL.md                         # Skill manifest + instructions
+├── .skilldata/
+│   ├── scripts/
+│   │   ├── ssh_tool.py              # SSH ControlMaster + command execution
+│   │   ├── epub_tool.py             # EPUB extraction + instruction parsing
+│   │   ├── course_tool.py           # Course detection + input resolution
+│   │   └── profile_tool.py          # Course profile from EPUB content
+│   └── docs/
+│       └── dynolabs-grading.md      # DynoLabs grading behavior reference
+├── results/                         # QA reports written here
+├── reference/                       # Historical skill versions
+└── docs/                            # Additional documentation
 ```
 
-## Troubleshooting
+**Python utilities** handle SSH connections, EPUB parsing, course detection, and profile building. All output JSON to stdout.
 
-### "Cannot connect to workstation"
-- Check SSH config: `~/.ssh/config` should have a `workstation` host
-- Test manually: `ssh workstation echo OK`
+**Claude** handles orchestration: test sequencing, interpreting results, retry/skip decisions, grading analysis, and report generation.
 
-### "Exercise not found in EPUB"
-- Verify EPUB exists and contains the exercise
-- Try rebuilding: `--rebuild-epub`
+## Test Categories
 
-### "Lab command not found"
-- Install rht-labs-core on workstation
-- Check: `ssh workstation which lab`
+| Category | What It Tests |
+|----------|---------------|
+| TC-PREREQ | Lab start works, environment ready |
+| TC-STUDENTSIM | EPUB instructions execute correctly |
+| TC-SOL | Solution files work |
+| TC-GRADE | Grading validates correctly (Labs) |
+| TC-CLEAN | Cleanup is complete |
+| TC-IDEM | Idempotency across cycles |
 
-### Path not in PATH
-Add to `~/.bashrc` or `~/.zshrc`:
-```bash
-export PATH="$HOME/.local/bin:$PATH"
-```
+## Bug Severity
 
-## Development
-
-### Running Without Install
-```bash
-cd eqa
-python3 -m src.main AU0024L scale-files
-```
-
-### Running Tests
-```bash
-# Test on a known-good exercise
-python3 -m src.main AU0022L control-flow --no-color
-
-# Test with verbose output
-python3 -u -m src.main AU0022L control-flow
-```
+| Level | Description |
+|-------|-------------|
+| P0 | Exercise unusable (lab start crashes, SSH broken) |
+| P1 | Validation broken (grading false positive/negative) |
+| P2 | Quality issue (instruction steps fail) |
+| P3 | Polish (typos, style) |
 
 ## License
 
 Internal Red Hat Training tool.
-
-## Version
-
-4.0 - Simplified architecture with enhanced features
