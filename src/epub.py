@@ -311,27 +311,55 @@ class EPUBParser:
         return exercises
 
     def _parse_chapter_file(self, file_path: Path) -> List[ExerciseContext]:
-        """Parse a chapter file to find exercises."""
+        """Parse a chapter file to find exercises.
+
+        Exercises are identified by CSS class on <section> elements:
+        - class="sect2 ge" for Guided Exercises
+        - class="sect2 lab" for Labs
+
+        The exercise ID (lab name) is extracted from the 'lab start <name>'
+        command found in the Prerequisites <pre> block.
+        """
         exercises = []
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
                 soup = BeautifulSoup(f, 'html.parser')
 
-            elements = soup.find_all(['section', 'h2', 'h3'])
-            for element in elements:
-                section_id = element.get('id', '')
-                if section_id.endswith('-ge'):
-                    base_id = section_id.removesuffix('-ge')
-                    exercises.append(self._create_exercise_context(
-                        base_id, ExerciseType.GUIDED_EXERCISE, element, file_path))
-                elif section_id.endswith('-lab'):
-                    base_id = section_id.removesuffix('-lab')
-                    exercises.append(self._create_exercise_context(
-                        base_id, ExerciseType.LAB, element, file_path))
+            for section in soup.find_all('section'):
+                classes = section.get('class', [])
+                if not isinstance(classes, list):
+                    classes = classes.split()
+                if 'sect2' not in classes:
+                    continue
+
+                is_ge = 'ge' in classes
+                is_lab = 'lab' in classes
+                if not is_ge and not is_lab:
+                    continue
+
+                ex_type = ExerciseType.GUIDED_EXERCISE if is_ge else ExerciseType.LAB
+
+                # Extract exercise ID from 'lab start <name>' in Prerequisites
+                exercise_id = self._extract_exercise_id_from_section(section)
+                if not exercise_id:
+                    continue
+
+                exercises.append(self._create_exercise_context(
+                    exercise_id, ex_type, section, file_path))
         except Exception as e:
             print(f"   Warning: Error parsing {file_path.name}: {e}")
 
         return exercises
+
+    def _extract_exercise_id_from_section(self, section: Tag) -> Optional[str]:
+        """Extract exercise ID from 'lab start <name>' in a section's Prerequisites."""
+        for pre in section.find_all('pre'):
+            text = pre.get_text()
+            if 'lab start' in text:
+                match = re.search(r'lab start(?:\s+-t\s+[\w-]+)?\s+([\w-]+)', text)
+                if match:
+                    return match.group(1)
+        return None
 
     def _create_exercise_context(self, exercise_id: str, ex_type: ExerciseType,
                                   section, file_path: Path) -> ExerciseContext:
@@ -471,18 +499,29 @@ class InstructionExtractor:
                 with open(html_file, 'r', encoding='utf-8') as f:
                     soup = BeautifulSoup(f, 'html.parser')
 
-                for section in soup.find_all(['h2', 'section']):
-                    section_id = section.get('id', '')
-                    if section_id.endswith('-ge'):
-                        base_id = section_id.removesuffix('-ge')
-                        instructions = self._parse_exercise_content(base_id, section)
+                for section in soup.find_all('section'):
+                    classes = section.get('class', [])
+                    if not isinstance(classes, list):
+                        classes = classes.split()
+                    if 'sect2' not in classes:
+                        continue
+                    if 'ge' not in classes and 'lab' not in classes:
+                        continue
+
+                    # Extract exercise ID from 'lab start <name>'
+                    exercise_id = None
+                    for pre in section.find_all('pre'):
+                        text = pre.get_text()
+                        if 'lab start' in text:
+                            match = re.search(r'lab start(?:\s+-t\s+[\w-]+)?\s+([\w-]+)', text)
+                            if match:
+                                exercise_id = match.group(1)
+                                break
+
+                    if exercise_id:
+                        instructions = self._parse_exercise_content(exercise_id, section)
                         if instructions:
-                            exercises[base_id] = instructions
-                    elif section_id.endswith('-lab'):
-                        base_id = section_id.removesuffix('-lab')
-                        instructions = self._parse_exercise_content(base_id, section)
-                        if instructions:
-                            exercises[base_id] = instructions
+                            exercises[exercise_id] = instructions
             except Exception as e:
                 print(f"   Warning: Error parsing {html_file.name}: {e}")
 
@@ -501,50 +540,69 @@ class InstructionExtractor:
     def _find_exercise_content(self, exercise_id: str) -> Optional[Tag]:
         """Find exercise content section in EPUB.
 
-        Exercise IDs are stored without -ge/-lab suffix, but the EPUB HTML
-        uses section IDs with the suffix. Try both forms.
+        Exercises are identified by CSS class (sect2 ge / sect2 lab) and
+        matched by finding 'lab start <exercise_id>' in the Prerequisites
+        <pre> block within the section.
         """
         if not self.content_dir.exists():
             return None
-
-        # Try: exact id, id-ge, id-lab
-        candidates = [exercise_id, f"{exercise_id}-ge", f"{exercise_id}-lab"]
 
         for html_file in self.content_dir.glob("*.xhtml"):
             try:
                 with open(html_file, 'r', encoding='utf-8') as f:
                     soup = BeautifulSoup(f, 'html.parser')
-                for candidate_id in candidates:
-                    element = soup.find(id=candidate_id)
-                    if element:
-                        return element
+
+                for section in soup.find_all('section'):
+                    classes = section.get('class', [])
+                    if not isinstance(classes, list):
+                        classes = classes.split()
+                    if 'sect2' not in classes:
+                        continue
+                    if 'ge' not in classes and 'lab' not in classes:
+                        continue
+
+                    # Match by 'lab start <exercise_id>' in prerequisites
+                    for pre in section.find_all('pre'):
+                        text = pre.get_text()
+                        if re.search(
+                            rf'lab start(?:\s+-t\s+[\w-]+)?\s+{re.escape(exercise_id)}\b',
+                            text,
+                        ):
+                            return section
             except Exception:
                 continue
         return None
 
     def _parse_exercise_content(self, exercise_id: str, element: Tag) -> ExerciseInstructions:
-        """Parse exercise content into structured instructions."""
+        """Parse exercise content into structured instructions.
+
+        Sub-sections are children of the main sect2 section, identified by
+        <h3> heading text (Outcomes, Prerequisites, Instructions) and/or
+        CSS class (sect3 Checklist, sect3 Lab).
+        """
         instructions = ExerciseInstructions(
             exercise_id=exercise_id,
             title=self._extract_title(element),
         )
 
-        current = element
-        while current:
-            current = current.find_next_sibling()
-            if not current:
-                break
-            if current.name == 'h2':
-                break
+        for child in element.find_all('section', recursive=False):
+            # Identify section by h3 heading text
+            h3 = child.find('h3')
+            heading_text = h3.get_text(strip=True).lower() if h3 else ''
 
-            if current.name == 'section':
-                section_title = current.get('title', '').lower()
-                if 'outcomes' in section_title:
-                    instructions.outcomes = self._parse_outcomes(current)
-                elif 'prerequisites' in section_title:
-                    instructions.prerequisites_command = self._parse_prerequisites(current)
-                elif 'instructions' in section_title:
-                    instructions.steps = self._parse_instructions(current)
+            # Also check CSS classes for section type
+            classes = child.get('class', [])
+            if not isinstance(classes, list):
+                classes = classes.split()
+
+            if 'outcomes' in heading_text or 'Outcomes' in classes:
+                instructions.outcomes = self._parse_outcomes(child)
+            elif 'prerequisites' in heading_text or 'Prerequisites' in classes:
+                instructions.prerequisites_command = self._parse_prerequisites(child)
+            elif ('instructions' in heading_text
+                  or 'Checklist' in classes
+                  or 'Lab' in classes):
+                instructions.steps = self._parse_instructions(child)
 
         def count_actions(steps):
             total = 0
@@ -557,7 +615,10 @@ class InstructionExtractor:
         return instructions
 
     def _extract_title(self, element: Tag) -> str:
-        """Extract exercise title."""
+        """Extract exercise title from <h2> or class='title'."""
+        h2 = element.find('h2')
+        if h2:
+            return re.sub(r'\s+', ' ', h2.get_text(' ', strip=True))
         title_elem = element.find(class_='title')
         if title_elem:
             return re.sub(r'\s+', ' ', title_elem.get_text(' ', strip=True))

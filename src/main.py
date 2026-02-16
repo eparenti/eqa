@@ -33,7 +33,12 @@ import yaml
 from .colors import disable_colors
 from .course import detect_course
 from .epub import EPUBBuilder, EPUBParser
-from .models import CourseResults, ExerciseType, SimulationResult
+from .models import (
+    CourseResults, CourseTestResults, ExerciseType,
+    SimulationResult, ExerciseTestResults
+)
+from .orchestrator import TestOrchestrator
+from .profile import CourseProfile, CourseProfileBuilder
 from .report import (
     generate_course_report,
     generate_report,
@@ -53,7 +58,7 @@ def main(args: Optional[List[str]] = None):
         description="Student simulation testing for Red Hat Training exercises",
     )
     parser.add_argument("input", help="EPUB path, lesson directory, or lesson code")
-    parser.add_argument("exercise", nargs="?", help="Exercise ID (optional, tests all if omitted)")
+    parser.add_argument("exercise", nargs="*", help="Exercise ID(s) (optional, tests all if omitted)")
     parser.add_argument("--format", default="markdown", choices=["markdown", "json", "junit", "all"])
     parser.add_argument("-o", "--output", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--quiet", action="store_true")
@@ -66,6 +71,10 @@ def main(args: Optional[List[str]] = None):
     parser.add_argument("--lesson-code", help="Lesson code for multi-repo courses (e.g., au0020l)")
     parser.add_argument("--test-solutions", action="store_true", help="Test solution files instead of student simulation")
     parser.add_argument("--cycles", type=int, default=1, help="Number of cycles for idempotency testing (default: 1)")
+    parser.add_argument("--mode", choices=["legacy", "categories"], default="categories",
+                        help="Test mode: legacy (old student sim) or categories (new test categories, default)")
+    parser.add_argument("--non-interactive", action="store_true",
+                        help="Non-interactive mode: skip exercises on connection failure instead of prompting")
 
     parsed = parser.parse_args(args)
 
@@ -92,39 +101,124 @@ def main(args: Optional[List[str]] = None):
 
     # Parse EPUB to get exercise list
     epub_parser = EPUBParser(epub_path, lesson_path)
+    course_profile = None  # Initialize to None in case of early exception
     try:
         course = epub_parser.parse()
+
+        # Build course profile from EPUB content
+        if not parsed.quiet:
+            print("\nAnalyzing course content...")
+        profile_builder = CourseProfileBuilder()
+        course_profile = profile_builder.build(
+            epub_extract_dir=Path(epub_parser.temp_dir),
+            exercises=course.exercises
+        )
+
+        # Display profile summary
+        if not parsed.quiet:
+            print(f"\n{course_profile.summary()}\n")
     finally:
         epub_parser.cleanup()
 
     # Determine which exercises to test
     if parsed.exercise:
-        exercise_ids = [parsed.exercise]
-        # Validate exercise exists
-        matching = [e for e in course.exercises if e.id == parsed.exercise]
-        if not matching:
-            # Try fuzzy match
-            candidates = [e.id for e in course.exercises
-                          if parsed.exercise in e.id or e.id in parsed.exercise]
-            if candidates:
-                print(f"Exercise '{parsed.exercise}' not found. Did you mean:")
-                for c in candidates:
-                    print(f"  - {c}")
+        # Multiple exercises specified
+        exercise_ids = []
+        for ex_id in parsed.exercise:
+            # Validate exercise exists
+            matching = [e for e in course.exercises if e.id == ex_id]
+            if not matching:
+                # Try fuzzy match
+                candidates = [e.id for e in course.exercises
+                              if ex_id in e.id or e.id in ex_id]
+                if candidates:
+                    print(f"Exercise '{ex_id}' not found. Did you mean:")
+                    for c in candidates:
+                        print(f"  - {c}")
+                else:
+                    print(f"Exercise '{ex_id}' not found in EPUB.")
+                    print(f"Available exercises:")
+                    for e in course.exercises[:10]:
+                        print(f"  - {e.id} ({e.type.value})")
+                    if len(course.exercises) > 10:
+                        print(f"  ... and {len(course.exercises) - 10} more")
+                return 1
             else:
-                print(f"Exercise '{parsed.exercise}' not found in EPUB.")
-                print(f"Available exercises:")
-                for e in course.exercises:
-                    print(f"  - {e.id} ({e.type.value})")
-            return 1
+                exercise_ids.append(ex_id)
     else:
         exercise_ids = [e.id for e in course.exercises]
 
     print(f"\nCourse: {course.course_code} ({course.course_title})")
     print(f"Testing {len(exercise_ids)} exercise(s)")
 
-    # Run simulations
-    results: List[SimulationResult] = []
     start_time = datetime.now()
+
+    # NEW: Test categories mode
+    if parsed.mode == "categories":
+        # Auto-detect non-interactive mode when stdin is not a TTY
+        import sys
+        interactive = not parsed.non_interactive and sys.stdin.isatty()
+
+        orchestrator = TestOrchestrator(
+            epub_path=epub_path,
+            workstation="workstation",
+            timeout_lab=parsed.timeout_lab,
+            timeout_command=parsed.timeout_command,
+            interactive=interactive,
+            lesson_code=parsed.lesson_code,
+        )
+
+        exercise_results: List[ExerciseTestResults] = []
+
+        try:
+            for i, exercise_id in enumerate(exercise_ids, 1):
+                print(f"\n[{i}/{len(exercise_ids)}] {exercise_id}")
+
+                # Get exercise context
+                exercise_ctx = course.get_exercise(exercise_id)
+                if not exercise_ctx:
+                    print(f"   ERROR: Exercise {exercise_id} not found in course")
+                    continue
+
+                # Attach course profile to exercise
+                exercise_ctx.course_profile = course_profile
+
+                # Run test categories
+                result = orchestrator.test_exercise(exercise_ctx)
+                exercise_results.append(result)
+
+                # Print result summary
+                print(f"\n   {result.summary}")
+        finally:
+            orchestrator.close()
+
+        # Calculate summary
+        total_duration = (datetime.now() - start_time).total_seconds()
+        passed = sum(1 for r in exercise_results if r.status == "PASS")
+        failed = sum(1 for r in exercise_results if r.status == "FAIL")
+        skipped = sum(1 for r in exercise_results if r.status == "SKIP")
+
+        print(f"\n{'='*60}")
+        print(f"SUMMARY: {passed}/{len(exercise_results)} exercises passed")
+        print(f"Failed: {failed}, Skipped: {skipped}")
+        print(f"Duration: {total_duration:.1f}s")
+        print(f"{'='*60}")
+
+        for r in exercise_results:
+            print(f"  [{r.status}] {r.exercise_id}")
+
+        # Show bugs found
+        all_bugs = [bug for r in exercise_results for bug in r.bugs]
+        if all_bugs:
+            print(f"\nBugs found: {len(all_bugs)}")
+            for bug in all_bugs:
+                print(f"  [{bug.severity.value}] {bug.id}: {bug.description}")
+
+        print(f"\nReports written to: {parsed.output}")
+        return 0 if failed == 0 else 1
+
+    # LEGACY: Old simulation mode
+    results: List[SimulationResult] = []
 
     for i, exercise_id in enumerate(exercise_ids, 1):
         print(f"\n[{i}/{len(exercise_ids)}] {exercise_id}")

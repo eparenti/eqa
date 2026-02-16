@@ -256,6 +256,7 @@ class StudentSimulator:
                     result.bugs.append(Bug(
                         id=f"{exercise_id}-P1-IDEM-{result.cycle:03d}",
                         severity=BugSeverity.P1_CRITICAL,
+                        category="LEGACY",
                         exercise_id=exercise_id,
                         description=f"Exercise not idempotent: Cycle {result.cycle} failed after Cycle 1 passed",
                         fix_recommendation="Review lab scripts for state pollution, ensure cleanup is complete, check for hardcoded values",
@@ -658,7 +659,7 @@ class StudentSimulator:
         if re.match(r'^ssh\s+\S+$', cmd):
             return None, "skipped interactive SSH session"
 
-        if ' -f ' in cmd or cmd.endswith(' -f'):
+        if cmd.startswith('tail') and (' -f ' in cmd or cmd.endswith(' -f')):
             converted = cmd.replace(' -f ', ' ').replace(' -f', '')
             return f"{converted} | head -50", "converted 'tail -f' to single read"
 
@@ -687,22 +688,44 @@ class StudentSimulator:
         return None
 
     def _run_grading(self, exercise_id: str, exercise_type: ExerciseType) -> SimulationResult:
-        """Run lab grade."""
+        """Run lab grade.
+
+        DynoLabs grading uses GradingSteps (non-fatal), so:
+        - Exit code 0 = script completed (doesn't mean checks passed!)
+        - Exit code != 0 = script crashed (fatal error)
+        - To determine pass/fail, parse output for SUCCESS/FAIL step statuses
+        """
         result = self.ssh.run_lab_command("grade", exercise_id, timeout=self.timeout_lab)
 
-        if result.success and result.return_code == 0:
-            print("   Grading passed")
+        # Check if script crashed (fatal error)
+        if not result.success or result.return_code != 0:
+            output = (result.stdout or "") + (result.stderr or "")
             return SimulationResult(
                 exercise_id=exercise_id, exercise_type=exercise_type,
-                success=True, phase="grade",
+                success=False, phase="grade",
+                error_message=f"Grading script crashed (rc={result.return_code}): {output[:200]}",
                 lab_grade_output=result.stdout,
             )
 
-        output = (result.stdout or "") + (result.stderr or "")
+        # Parse output for step status indicators (DynoLabs v4/v5)
+        pass_count = len(re.findall(r'\b(SUCCESS|PASS)\b', result.stdout))
+        fail_count = len(re.findall(r'\b(FAIL)\b', result.stdout))
+
+        # If any checks failed, grading failed
+        if fail_count > 0:
+            print(f"   Grading failed ({fail_count} checks failed)")
+            return SimulationResult(
+                exercise_id=exercise_id, exercise_type=exercise_type,
+                success=False, phase="grade",
+                error_message=f"Grading failed: {fail_count}/{pass_count + fail_count} checks failed",
+                lab_grade_output=result.stdout,
+            )
+
+        # All checks passed (or no checks found - be lenient)
+        print(f"   Grading passed ({pass_count} checks passed)")
         return SimulationResult(
             exercise_id=exercise_id, exercise_type=exercise_type,
-            success=False, phase="grade",
-            error_message=f"Grading failed (rc={result.return_code}): {output[:200]}",
+            success=True, phase="grade",
             lab_grade_output=result.stdout,
         )
 
@@ -842,6 +865,7 @@ class StudentSimulator:
             bugs.append(Bug(
                 id=f"{result.exercise_id}-P0-001",
                 severity=BugSeverity.P0_BLOCKER,
+                category="LEGACY",
                 exercise_id=result.exercise_id,
                 description=f"Cannot connect to workstation: {result.error_message}",
                 fix_recommendation="Check SSH configuration, workstation availability, and network connectivity",
@@ -851,6 +875,7 @@ class StudentSimulator:
             bugs.append(Bug(
                 id=f"{result.exercise_id}-P0-002",
                 severity=BugSeverity.P0_BLOCKER,
+                category="LEGACY",
                 exercise_id=result.exercise_id,
                 description="Lab command not available on workstation",
                 fix_recommendation="Install rht-labs-core package or verify course environment setup",
@@ -862,6 +887,7 @@ class StudentSimulator:
             bugs.append(Bug(
                 id=f"{result.exercise_id}-P1-001",
                 severity=BugSeverity.P1_CRITICAL,
+                category="LEGACY",
                 exercise_id=result.exercise_id,
                 description=f"Lab start failed: {result.error_message}",
                 fix_recommendation="Review start playbook, check managed host connectivity, verify prerequisites",
@@ -871,6 +897,7 @@ class StudentSimulator:
             bugs.append(Bug(
                 id=f"{result.exercise_id}-P1-002",
                 severity=BugSeverity.P1_CRITICAL,
+                category="LEGACY",
                 exercise_id=result.exercise_id,
                 description=f"Grading failed: {result.error_message}",
                 fix_recommendation="Review grading script, ensure validation logic is correct, test grading manually",
@@ -880,6 +907,7 @@ class StudentSimulator:
             bugs.append(Bug(
                 id=f"{result.exercise_id}-P1-003",
                 severity=BugSeverity.P1_CRITICAL,
+                category="LEGACY",
                 exercise_id=result.exercise_id,
                 description=f"Lab finish failed: {result.error_message}",
                 fix_recommendation="Review finish playbook, ensure cleanup tasks are idempotent and handle missing resources gracefully",
@@ -889,6 +917,7 @@ class StudentSimulator:
             bugs.append(Bug(
                 id=f"{result.exercise_id}-P1-004",
                 severity=BugSeverity.P1_CRITICAL,
+                category="LEGACY",
                 exercise_id=result.exercise_id,
                 description="Solution files don't work",
                 fix_recommendation="Test solution files manually, check for missing variables or configuration",
@@ -903,6 +932,7 @@ class StudentSimulator:
                 bugs.append(Bug(
                     id=bug_id,
                     severity=BugSeverity.P2_HIGH,
+                    category="LEGACY",
                     exercise_id=result.exercise_id,
                     description=f"Instruction step failed: {step.text[:100]}",
                     fix_recommendation=f"Review command: {step.command}. Error: {(step.error or '')[:200]}",
@@ -916,6 +946,7 @@ class StudentSimulator:
                 bugs.append(Bug(
                     id=f"{result.exercise_id}-P1-005",
                     severity=BugSeverity.P1_CRITICAL,
+                    category="LEGACY",
                     exercise_id=result.exercise_id,
                     description="Grading passed without solution (should fail)",
                     fix_recommendation="Review grading script to ensure it validates student work, not just checks if files exist",
@@ -926,6 +957,7 @@ class StudentSimulator:
                 bugs.append(Bug(
                     id=f"{result.exercise_id}-P1-006",
                     severity=BugSeverity.P1_CRITICAL,
+                    category="LEGACY",
                     exercise_id=result.exercise_id,
                     description="Grading failed with solution (should pass)",
                     fix_recommendation="Review grading script validation logic, compare with solution files",
@@ -935,7 +967,11 @@ class StudentSimulator:
         return bugs
 
     def _detect_exercise_type(self, exercise_id: str) -> ExerciseType:
-        """Detect exercise type by checking which section ID exists in the EPUB."""
+        """Detect exercise type by finding the exercise section in the EPUB.
+
+        Exercises are identified by CSS class (sect2 ge / sect2 lab) and
+        matched by 'lab start <exercise_id>' in the Prerequisites block.
+        """
         extractor = InstructionExtractor(self.epub_path)
         try:
             extractor._extract_epub()
@@ -944,10 +980,22 @@ class StudentSimulator:
                     with open(html_file, 'r', encoding='utf-8') as f:
                         from bs4 import BeautifulSoup
                         soup = BeautifulSoup(f, 'html.parser')
-                    if soup.find(id=f"{exercise_id}-lab"):
-                        return ExerciseType.LAB
-                    if soup.find(id=f"{exercise_id}-ge"):
-                        return ExerciseType.GUIDED_EXERCISE
+                    for section in soup.find_all('section'):
+                        classes = section.get('class', [])
+                        if not isinstance(classes, list):
+                            classes = classes.split()
+                        if 'sect2' not in classes:
+                            continue
+                        # Check if this section matches the exercise
+                        for pre in section.find_all('pre'):
+                            text = pre.get_text()
+                            if re.search(
+                                rf'lab start(?:\s+-t\s+[\w-]+)?\s+{re.escape(exercise_id)}\b',
+                                text,
+                            ):
+                                if 'lab' in classes:
+                                    return ExerciseType.LAB
+                                return ExerciseType.GUIDED_EXERCISE
                 except Exception:
                     continue
         finally:

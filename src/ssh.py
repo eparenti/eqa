@@ -5,7 +5,9 @@ repeated connections through ProxyJump.
 """
 
 import atexit
+import json
 import os
+import re
 import subprocess
 import tempfile
 import time
@@ -13,6 +15,14 @@ from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
 import pexpect
+
+
+def _strip_ansi(text: str) -> str:
+    """Strip ANSI escape codes and spinner characters from output."""
+    text = re.sub(r'\x1b\[[0-9;]*[A-Za-z]', '', text)
+    text = re.sub(r'\x1b\][^\x07]*\x07', '', text)  # OSC sequences
+    text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', text)  # control chars (keep \n \r \t)
+    return text
 
 
 @dataclass
@@ -33,15 +43,30 @@ class SSHConnection:
     once and all subsequent commands reuse it instantly.
     """
 
-    def __init__(self, host: str, username: str = "student"):
+    def __init__(self, host: str, username: str = "student",
+                 max_retries: int = 3, retry_delay: float = 2.0):
+        """
+        Initialize SSH connection.
+
+        Args:
+            host: Hostname (e.g., 'workstation')
+            username: SSH username
+            max_retries: Number of connection retry attempts
+            retry_delay: Seconds between retries (exponential backoff)
+        """
         self.host = host
         self.username = username
+        self.max_retries = max_retries
+        self.retry_delay = retry_delay
         self._connected = False
+        self._framework_cache = None
 
         # ControlMaster socket path
-        self._control_dir = tempfile.mkdtemp(prefix="exercise-qa-ssh-")
+        self._control_dir = tempfile.mkdtemp(prefix="eqa-ssh-")
         self._control_path = os.path.join(self._control_dir, f"{host}.sock")
+        self._master_process = None
 
+        # Clean up on exit
         atexit.register(self._cleanup_master)
 
     def _ssh_opts(self) -> List[str]:
@@ -91,29 +116,194 @@ class SSHConnection:
         except Exception:
             pass
 
-    def connect(self) -> bool:
-        """Establish SSH ControlMaster connection with retry."""
-        for attempt in range(3):
+    def connect(self, verify_lab_tools: bool = True) -> bool:
+        """
+        Establish SSH ControlMaster connection with retry logic.
+
+        Args:
+            verify_lab_tools: If True, verify that 'lab' command exists on remote
+        """
+        for attempt in range(self.max_retries):
+            # Start ControlMaster
             if self._start_master():
+                # Verify it works with a quick command
                 result = subprocess.run(
                     ['ssh'] + self._ssh_opts() + [self.host, 'echo', 'connected'],
                     capture_output=True, text=True, timeout=10,
                 )
+
                 if result.returncode == 0 and 'connected' in result.stdout:
                     self._connected = True
-                    # Verify lab command exists
-                    lab_check = self.run("which lab 2>/dev/null", timeout=10)
-                    if not lab_check.success or not lab_check.stdout.strip():
-                        print("WARNING: 'lab' command not found on remote system")
+
+                    # Verify lab tools are available
+                    if verify_lab_tools:
+                        tools_ok, missing = self._verify_lab_tools()
+                        if not tools_ok:
+                            print(f"⚠️  Missing tools on {self.host}: {', '.join(missing)}")
+
                     return True
 
-            if attempt < 2:
-                delay = 2.0 * (2 ** attempt)
-                print(f"Connection attempt {attempt + 1} failed, retrying in {delay}s...")
+            if attempt < self.max_retries - 1:
+                delay = self.retry_delay * (2 ** attempt)
+                print(f"⚠️  Connection attempt {attempt + 1} failed, retrying in {delay}s...")
                 time.sleep(delay)
 
-        print(f"SSH connection failed after 3 attempts")
+        print(f"❌ SSH connection failed after {self.max_retries} attempts")
         return False
+
+    def is_connected(self) -> bool:
+        """Check if SSH connection is established."""
+        return self._connected
+
+    def _verify_lab_tools(self) -> Tuple[bool, List[str]]:
+        """
+        Verify that essential lab tools are available on the remote system.
+
+        Returns:
+            Tuple of (all_present, list_of_missing_tools)
+        """
+        essential_tools = ['lab']
+        missing = []
+
+        for tool in essential_tools:
+            result = self.run(f"which {tool} 2>/dev/null", timeout=10)
+            if not result.success or not result.stdout.strip():
+                missing.append(tool)
+
+        return len(missing) == 0, missing
+
+    def detect_lab_framework(self) -> Tuple[str, str]:
+        """
+        Detect which lab framework is available (cached after first call).
+
+        DynoLabs 5 variants:
+        - Rust CLI: 'lab' binary (from classroom-api/rust)
+        - Python grading: 'uv run lab' from grading directory
+
+        Earlier versions:
+        - Factory wrapper: 'lab' shell script
+        - Legacy DynoLabs: Python 'lab' command
+
+        Returns:
+            Tuple of (framework_type, command_prefix)
+            - ('dynolabs5-rust', 'lab') for Rust CLI (classroom-api)
+            - ('dynolabs5-python', 'cd ~/grading && uv run lab') for Python grading
+            - ('wrapper', 'lab') for Factory wrapper script
+            - ('dynolabs', 'lab') for legacy DynoLabs
+        """
+        if self._framework_cache is not None:
+            return self._framework_cache
+
+        # Check for standard lab command first
+        result = self.run("which lab 2>/dev/null", timeout=10)
+        has_lab = result.success and result.stdout.strip()
+
+        if has_lab:
+            lab_path = result.stdout.strip()
+
+            # Check if it's Rust CLI (DynoLabs 5)
+            # Rust binaries are ELF executables, not scripts
+            result = self.run(f"file {lab_path} 2>/dev/null", timeout=10)
+            file_type = result.stdout.lower() if result.success else ""
+
+            if 'elf' in file_type or 'executable' in file_type:
+                # Could be Rust CLI - check for version with specific format
+                result = self.run("lab --version 2>/dev/null", timeout=10)
+                if result.success and 'lab' in result.stdout.lower():
+                    # Rust CLI has features like autotest
+                    result = self.run("lab --help 2>/dev/null | grep -q autotest && echo 'rust'", timeout=10)
+                    if result.success and 'rust' in result.stdout:
+                        self._framework_cache = ('dynolabs5-rust', 'lab')
+                        return self._framework_cache
+
+            if 'script' in file_type or 'text' in file_type:
+                # Shell script - likely Factory wrapper
+                self._framework_cache = ('wrapper', 'lab')
+                return self._framework_cache
+
+            # Default to legacy dynolabs for other executables
+            self._framework_cache = ('dynolabs', 'lab')
+            return self._framework_cache
+
+        # Check for DynoLabs 5 Python grading (uv-based)
+        result = self.run("which uv 2>/dev/null", timeout=10)
+        has_uv = result.success and result.stdout.strip()
+
+        result = self.run("test -f ~/grading/pyproject.toml && echo 'exists'", timeout=10)
+        has_grading_pyproject = result.success and 'exists' in result.stdout
+
+        if has_uv and has_grading_pyproject:
+            self._framework_cache = ('dynolabs5-python', 'cd ~/grading && uv run lab')
+            return self._framework_cache
+
+        self._framework_cache = ('unknown', 'lab')
+        return self._framework_cache
+
+    def run_autotest(self, ignore_errors: bool = False, timeout: int = 1800) -> CommandResult:
+        """
+        Run DynoLabs 5 autotest command (Rust CLI feature).
+
+        Executes randomized comprehensive lab validation.
+
+        Args:
+            ignore_errors: Continue testing even if some labs fail
+            timeout: Timeout in seconds (default: 30 minutes)
+
+        Returns:
+            CommandResult
+        """
+        framework, _ = self.detect_lab_framework()
+
+        if framework != 'dynolabs5-rust':
+            return CommandResult(
+                command="lab autotest",
+                success=False,
+                return_code=-1,
+                stdout="",
+                stderr=f"autotest requires DynoLabs 5 Rust CLI (detected: {framework})",
+                duration_seconds=0
+            )
+
+        cmd = "lab autotest"
+        if ignore_errors:
+            cmd += " --ignore-errors"
+
+        print(f"   Running: {cmd}")
+        return self.run(cmd, timeout=timeout)
+
+    def run_coursetest(self, scripts_file: str = "scripts.yml",
+                       dry_run: bool = False, timeout: int = 3600) -> CommandResult:
+        """
+        Run DynoLabs 5 coursetest command (Rust CLI feature).
+
+        Executes sequential course workflow testing.
+
+        Args:
+            scripts_file: Path to scripts.yml file
+            dry_run: Show what would be run without executing
+            timeout: Timeout in seconds (default: 60 minutes)
+
+        Returns:
+            CommandResult
+        """
+        framework, _ = self.detect_lab_framework()
+
+        if framework != 'dynolabs5-rust':
+            return CommandResult(
+                command="lab coursetest",
+                success=False,
+                return_code=-1,
+                stdout="",
+                stderr=f"coursetest requires DynoLabs 5 Rust CLI (detected: {framework})",
+                duration_seconds=0
+            )
+
+        cmd = f"lab coursetest {scripts_file}"
+        if dry_run:
+            cmd += " --dry-run"
+
+        print(f"   Running: {cmd}")
+        return self.run(cmd, timeout=timeout)
 
     def run(self, command: str, timeout: int = 30) -> CommandResult:
         """Execute command via SSH using the ControlMaster socket."""
@@ -130,8 +320,8 @@ class SSHConnection:
                 command=command,
                 success=(result.returncode == 0),
                 return_code=result.returncode,
-                stdout=result.stdout,
-                stderr=result.stderr,
+                stdout=_strip_ansi(result.stdout),
+                stderr=_strip_ansi(result.stderr),
                 duration_seconds=duration,
             )
 
@@ -150,56 +340,62 @@ class SSHConnection:
 
     def run_lab_command(self, action: str, exercise_name: str,
                         timeout: int = 300) -> CommandResult:
-        """Run a lab command (start, grade, finish).
-
-        Handles the case where another lab is in progress by finishing
-        the blocking lab first, exactly as a student would.
         """
-        import re
+        Run a lab command with automatic framework detection.
 
-        result = self.run(f"lab {action} {exercise_name}", timeout=timeout)
+        Args:
+            action: Lab action (start, finish, grade)
+            exercise_name: Exercise name/slug
+            timeout: Timeout in seconds
 
-        # The lab CLI returns rc=0 even when blocked by another lab.
-        # It prints "another lab is in progress" and tells the user
-        # to run "lab finish <blocking-lab>". Do what the student would do.
-        if action == 'start' and 'another lab is in progress' in result.stdout:
-            match = re.search(r'lab finish\s+(\S+)', result.stdout)
+        Returns:
+            CommandResult
+        """
+        framework, prefix = self.detect_lab_framework()
+
+        # Strip -ge/-lab suffix only from end of name (not mid-word)
+        lab_name = exercise_name.removesuffix('-ge').removesuffix('-lab')
+
+        cmd = f"{prefix} {action} {lab_name}"
+        print(f"   Running: {cmd} (framework: {framework})")
+
+        result = self.run(cmd, timeout=timeout)
+
+        # If lab start fails because another lab is running, the lab CLI
+        # names the blocking lab in its output. Finish it and retry.
+        if not result.success and action == 'start':
+            output = result.stdout + result.stderr
+            match = re.search(r'lab finish\s+(\S+)', output)
             if match:
                 blocking_lab = match.group(1)
-                # Strip ANSI codes from the matched lab name
-                blocking_lab = re.sub(r'\x1b\[[0-9;]*m', '', blocking_lab)
                 print(f"   Finishing blocking lab: {blocking_lab}")
-                finish_result = self.run(f"lab finish {blocking_lab}", timeout=120)
-                # If finish fails, reset the blocking lab's state
-                if not finish_result.success or 'error' in finish_result.stderr.lower():
-                    print(f"   Finish failed, resetting: {blocking_lab}")
-                    self.run(f"lab status {blocking_lab} --reset", timeout=30)
-                result = self.run(f"lab {action} {exercise_name}", timeout=timeout)
+                self.run(f"{prefix} finish {blocking_lab}", timeout=120)
+                print(f"   Retrying: {cmd}")
+                result = self.run(cmd, timeout=timeout)
 
-        # The lab CLI sometimes returns rc=0 even when the action failed.
-        # Check stdout for failure indicators.
-        if result.success and ('lab start failed' in result.stdout.lower()
-                               or 'lab finish failed' in result.stdout.lower()
-                               or 'lab grade failed' in result.stdout.lower()
-                               or 'cannot continue lab script' in result.stdout.lower()):
-            result = CommandResult(
-                command=result.command,
-                success=False,
-                return_code=1,
-                stdout=result.stdout,
-                stderr=result.stderr,
-                duration_seconds=result.duration_seconds,
-            )
+        # Check stdout for failure indicators (DynoLabs v4/v5 format).
+        # For start/finish, any FAIL step means the operation failed.
+        # For grade, FAIL steps are expected (grading check results).
+        if result.success and action in ('start', 'finish'):
+            if re.search(r'\bFAIL\b', result.stdout):
+                result = CommandResult(
+                    command=result.command,
+                    success=False,
+                    return_code=1,
+                    stdout=result.stdout,
+                    stderr=result.stderr,
+                    duration_seconds=result.duration_seconds,
+                )
 
         return result
 
     def force_lesson(self, lesson_code: str, timeout: int = 120) -> CommandResult:
-        """Run lab force to install a lesson package.
+        """Run lab install to activate a lesson package.
 
-        For multi-repo courses, each lesson must be forced before its
+        For multi-repo courses, each lesson must be installed before its
         exercises can be tested.
         """
-        return self.run(f"lab force {lesson_code.lower()}", timeout=timeout)
+        return self.run(f"lab install {lesson_code.lower()}", timeout=timeout)
 
     def run_interactive(self, command: str, prompts: List[Tuple[str, str]],
                         timeout: int = 120) -> CommandResult:
@@ -214,8 +410,9 @@ class SSHConnection:
         output_buffer = []
 
         try:
-            ssh_cmd = (f"ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no "
-                       f"{self.username}@{self.host} {command}")
+            ssh_cmd = (f"ssh -o ControlPath={self._control_path} "
+                       f"-o ConnectTimeout=10 "
+                       f"{self.host} {command}")
             child = pexpect.spawn(ssh_cmd, timeout=timeout, encoding='utf-8')
 
             for prompt_pattern, response in prompts:
@@ -359,6 +556,60 @@ class SSHConnection:
     def stop_devcontainer(self, container_name: str = "qa-devcontainer"):
         """Stop and remove the dev container."""
         self.run(f"podman rm -f {container_name} 2>/dev/null", timeout=15)
+
+    def parse_devcontainer_json(self, exercise_dir: str) -> Optional[dict]:
+        """Read and parse devcontainer.json from the exercise directory on the workstation.
+
+        Checks both .devcontainer/podman/ and .devcontainer/ paths.
+
+        Returns:
+            Parsed JSON config dict, or None if not found.
+        """
+        for dc_path in [
+            f"{exercise_dir}/.devcontainer/podman/devcontainer.json",
+            f"{exercise_dir}/.devcontainer/devcontainer.json",
+        ]:
+            content = self.read_file(dc_path)
+            if content:
+                try:
+                    return json.loads(content)
+                except json.JSONDecodeError:
+                    continue
+        return None
+
+    def ensure_devcontainer(self, exercise_dir: str,
+                            container_name: str = "qa-devcontainer") -> Optional[dict]:
+        """Parse devcontainer.json and start the container if not running.
+
+        Returns:
+            Dict with 'workdir', 'user', 'image' on success, None on failure.
+        """
+        config = self.parse_devcontainer_json(exercise_dir)
+        if not config:
+            return None
+
+        image = config.get("image", "")
+        run_args = config.get("runArgs", [])
+        container_user = config.get("containerUser")
+        if not image:
+            return None
+
+        exercise_name = exercise_dir.rstrip('/').split('/')[-1]
+
+        result = self.start_devcontainer(
+            image=image, run_args=run_args,
+            project_dir=exercise_dir,
+            container_name=container_name,
+            container_user=container_user,
+        )
+
+        if result.success:
+            return {
+                'workdir': f"/workspaces/{exercise_name}",
+                'user': container_user,
+                'image': image,
+            }
+        return None
 
     @staticmethod
     def _shell_quote(s: str) -> str:

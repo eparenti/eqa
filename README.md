@@ -10,6 +10,7 @@ Fully automated quality assurance testing for Red Hat Training exercises.
 - **Idempotency Testing** - Multi-cycle testing for reliability
 - **Bug Detection** - Auto-classifies bugs by severity (P0-P3)
 - **Dev Container Support** - Works with ansible-dev-tools containers
+- **Interactive Mode** - Prompts when lab environment isn't ready, gives you time to set it up
 - **Multiple Report Formats** - Markdown, JSON, JUnit
 - **Chapter-Level Testing** - Test by chapter number
 - **Course-Wide Testing** - Test all exercises at once
@@ -81,6 +82,39 @@ eqa AU0024L scale-files --format all
 eqa AU0024L scale-files --output /tmp/qa-reports
 ```
 
+### Interactive Mode
+
+When EQA can't connect to the lab workstation, it prompts you to retry, skip, or abort:
+
+```bash
+# Interactive mode (default) - prompts on connection failure
+eqa AU294 control-review
+
+# Prompt example:
+⚠️  Cannot connect to workstation: workstation
+
+Options:
+  [R] Retry - Try connecting again (I'm setting up the environment)
+  [S] Skip  - Skip this exercise and continue with the next one
+  [A] Abort - Stop all testing
+
+Your choice [R/s/a]:
+```
+
+**Use cases:**
+- Testing multiple exercises - start each lab environment as needed
+- Classroom testing - ephemeral lab environments
+- Development - test specific exercises while setting up infrastructure
+
+**Non-interactive mode** for CI/CD:
+
+```bash
+# Skips exercises on connection failure (no prompts)
+eqa AU294 --non-interactive
+```
+
+See [docs/interactive-mode.md](docs/interactive-mode.md) for detailed usage.
+
 ### Command-Line Options
 
 ```
@@ -98,6 +132,9 @@ options:
   --test-solutions     Test solution files instead of student simulation
   --chapter N          Test only chapter N (requires course code input)
   --lesson-code CODE   Lesson code for multi-repo courses (e.g., au0020l)
+  --non-interactive    Skip exercises on connection failure instead of prompting
+  --mode {legacy,categories}
+                        Test mode (default: categories)
   --rebuild-epub       Force EPUB rebuild
   --timeout-lab SEC    Lab command timeout (default: 300)
   --timeout-command SEC Command timeout (default: 120)
