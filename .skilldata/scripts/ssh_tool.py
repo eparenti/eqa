@@ -195,12 +195,91 @@ def _detect_framework(state: dict) -> tuple:
     return ('unknown', 'lab')
 
 
+def _check_connection(state: dict) -> bool:
+    """Verify ControlMaster socket is still alive."""
+    control_path = state.get("control_path", "")
+    if not os.path.exists(control_path):
+        return False
+    try:
+        result = subprocess.run(
+            ['ssh', '-o', f'ControlPath={control_path}', '-O', 'check', state["host"]],
+            capture_output=True, text=True, timeout=5,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def cmd_status(args):
+    """Check connection status, framework info, and disk space."""
+    state = _load_state()
+    if not state:
+        _output({"success": True, "connected": False, "message": "No active connection"})
+        return
+
+    alive = _check_connection(state)
+
+    result = {
+        "success": True,
+        "connected": alive,
+        "host": state.get("host"),
+        "framework": state.get("framework"),
+        "framework_prefix": state.get("framework_prefix"),
+        "control_path": state.get("control_path"),
+        "devcontainer": state.get("devcontainer"),
+    }
+
+    if alive:
+        # Check disk space
+        try:
+            disk = subprocess.run(
+                ['ssh'] + _ssh_opts(state) + [state["host"], "df -h / --output=avail,pcent | tail -1"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if disk.returncode == 0:
+                result["disk_free"] = disk.stdout.strip()
+        except Exception:
+            pass
+
+    _output(result)
+
+
 def cmd_run(args):
     """Execute command via ControlMaster."""
     state = _load_state()
     if not state:
         _output({"success": False, "error": "Not connected. Run 'connect' first."})
         return
+
+    # Check for stale socket
+    if not _check_connection(state):
+        _err("ControlMaster socket is stale, reconnecting...")
+        # Attempt reconnect
+        host = state["host"]
+        control_dir = state.get("control_dir", tempfile.mkdtemp(prefix="eqa-ssh-"))
+        control_path = os.path.join(control_dir, f"{host}.sock")
+        try:
+            cmd = [
+                'ssh',
+                '-o', f'ControlPath={control_path}',
+                '-o', 'ControlMaster=yes',
+                '-o', 'ControlPersist=600',
+                '-o', 'ConnectTimeout=15',
+                '-N', '-f',
+                host,
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            if result.returncode == 0:
+                state["control_path"] = control_path
+                state["control_dir"] = control_dir
+                _save_state(state)
+                _err("Reconnected successfully")
+            else:
+                _output({"success": False, "error": "Connection lost and reconnect failed. Run 'connect' again."})
+                return
+        except Exception as e:
+            _output({"success": False, "error": f"Reconnect failed: {e}"})
+            return
 
     command = args.command
     timeout = args.timeout
@@ -268,8 +347,10 @@ def cmd_lab(args):
         stderr = _strip_ansi(result.stderr)
         success = result.returncode == 0
 
-        # If lab start fails due to blocking lab, finish it and retry
-        if not success and action == 'start':
+        # If lab start fails or warns about a blocking lab, finish it and retry.
+        # Some frameworks return exit code 0 but print a warning with
+        # "lab finish <name>" in stdout instead of failing outright.
+        if action == 'start':
             output = stdout + stderr
             match = re.search(r'lab finish\s+(\S+)', output)
             if match:
@@ -483,6 +564,18 @@ def cmd_devcontainer_start(args):
 
     exercise_name = project_dir.rstrip('/').split('/')[-1]
 
+    # Check disk space before starting (need ~2GB for container + EE image)
+    ok_df, df_out, _ = ssh_run("df / --output=avail | tail -1")
+    if ok_df:
+        try:
+            avail_kb = int(df_out.strip())
+            avail_gb = avail_kb / (1024 * 1024)
+            if avail_gb < 2.0:
+                _err(f"WARNING: Only {avail_gb:.1f}GB free on workstation. Dev container + EE image needs ~2GB.")
+                _err("Consider running: ssh workstation 'podman system prune -af && rm -rf ~/.cache/uv'")
+        except (ValueError, TypeError):
+            pass
+
     # Stop any existing container
     ssh_run(f"podman rm -f {container_name} 2>/dev/null", timeout=10)
 
@@ -595,6 +688,90 @@ def cmd_devcontainer_stop(args):
         _output({"success": False, "error": str(e)})
 
 
+def cmd_autotest(args):
+    """Run DynoLabs 5 autotest (Rust CLI only)."""
+    state = _load_state()
+    if not state:
+        _output({"success": False, "error": "Not connected. Run 'connect' first."})
+        return
+
+    framework = state.get("framework", "unknown")
+    if framework != 'dynolabs5-rust':
+        _output({
+            "success": False,
+            "error": f"autotest requires DynoLabs 5 Rust CLI (detected: {framework})",
+        })
+        return
+
+    cmd = "lab autotest"
+    if args.ignore_errors:
+        cmd += " --ignore-errors"
+
+    _err(f"Running: {cmd}")
+    start_time = time.time()
+    try:
+        result = subprocess.run(
+            ['ssh'] + _ssh_opts(state) + [state["host"], cmd],
+            capture_output=True, text=True, timeout=args.timeout,
+        )
+        duration = time.time() - start_time
+        _output({
+            "success": result.returncode == 0,
+            "return_code": result.returncode,
+            "stdout": _strip_ansi(result.stdout),
+            "stderr": _strip_ansi(result.stderr),
+            "duration": round(duration, 2),
+        })
+    except subprocess.TimeoutExpired:
+        _output({
+            "success": False, "return_code": -1,
+            "stdout": "", "stderr": f"autotest timed out after {args.timeout}s",
+            "duration": args.timeout,
+        })
+
+
+def cmd_coursetest(args):
+    """Run DynoLabs 5 coursetest (Rust CLI only)."""
+    state = _load_state()
+    if not state:
+        _output({"success": False, "error": "Not connected. Run 'connect' first."})
+        return
+
+    framework = state.get("framework", "unknown")
+    if framework != 'dynolabs5-rust':
+        _output({
+            "success": False,
+            "error": f"coursetest requires DynoLabs 5 Rust CLI (detected: {framework})",
+        })
+        return
+
+    cmd = f"lab coursetest {args.scripts_file}"
+    if args.dry_run:
+        cmd += " --dry-run"
+
+    _err(f"Running: {cmd}")
+    start_time = time.time()
+    try:
+        result = subprocess.run(
+            ['ssh'] + _ssh_opts(state) + [state["host"], cmd],
+            capture_output=True, text=True, timeout=args.timeout,
+        )
+        duration = time.time() - start_time
+        _output({
+            "success": result.returncode == 0,
+            "return_code": result.returncode,
+            "stdout": _strip_ansi(result.stdout),
+            "stderr": _strip_ansi(result.stderr),
+            "duration": round(duration, 2),
+        })
+    except subprocess.TimeoutExpired:
+        _output({
+            "success": False, "return_code": -1,
+            "stdout": "", "stderr": f"coursetest timed out after {args.timeout}s",
+            "duration": args.timeout,
+        })
+
+
 def cmd_disconnect(args):
     """Tear down ControlMaster connection."""
     state = _load_state()
@@ -637,6 +814,10 @@ def main():
     p_connect = subparsers.add_parser("connect")
     p_connect.add_argument("--host", default="workstation")
     p_connect.set_defaults(func=cmd_connect)
+
+    # status
+    p_status = subparsers.add_parser("status")
+    p_status.set_defaults(func=cmd_status)
 
     # run
     p_run = subparsers.add_parser("run")
@@ -685,6 +866,19 @@ def main():
     # devcontainer-stop
     p_dc_stop = subparsers.add_parser("devcontainer-stop")
     p_dc_stop.set_defaults(func=cmd_devcontainer_stop)
+
+    # autotest
+    p_autotest = subparsers.add_parser("autotest")
+    p_autotest.add_argument("--ignore-errors", action="store_true")
+    p_autotest.add_argument("--timeout", type=int, default=1800)
+    p_autotest.set_defaults(func=cmd_autotest)
+
+    # coursetest
+    p_coursetest = subparsers.add_parser("coursetest")
+    p_coursetest.add_argument("scripts_file", nargs="?", default="scripts.yml")
+    p_coursetest.add_argument("--dry-run", action="store_true")
+    p_coursetest.add_argument("--timeout", type=int, default=3600)
+    p_coursetest.set_defaults(func=cmd_coursetest)
 
     # disconnect
     p_disconnect = subparsers.add_parser("disconnect")

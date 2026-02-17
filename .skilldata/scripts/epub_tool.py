@@ -22,6 +22,20 @@ import tempfile
 import zipfile
 from pathlib import Path
 
+# Lazy-loaded at first use
+_bs4_loaded = False
+Tag = None
+BeautifulSoup = None
+
+
+def _ensure_bs4():
+    global _bs4_loaded, Tag, BeautifulSoup
+    if not _bs4_loaded:
+        from bs4 import BeautifulSoup as BS, Tag as T
+        BeautifulSoup = BS
+        Tag = T
+        _bs4_loaded = True
+
 
 def _output(data):
     print(json.dumps(data, default=str))
@@ -47,7 +61,7 @@ def _epub_cache_dir(epub_path: str) -> str:
 
 def _find_exercises(content_dir: str, lesson_path: str = None):
     """Find all exercises in extracted EPUB content."""
-    from bs4 import BeautifulSoup
+    _ensure_bs4()
 
     exercises = []
     content_path = Path(content_dir)
@@ -131,7 +145,7 @@ def _find_solution_files(exercise_id: str, lesson_path: str) -> list:
 
 def cmd_parse(args):
     """Parse EPUB and return course structure."""
-    from bs4 import BeautifulSoup
+    _ensure_bs4()
 
     epub_path = os.path.abspath(args.epub_path)
     if not os.path.exists(epub_path):
@@ -179,7 +193,7 @@ def cmd_parse(args):
 
 def cmd_instructions(args):
     """Extract step-by-step instructions for a specific exercise."""
-    from bs4 import BeautifulSoup, Tag
+    _ensure_bs4()
 
     epub_path = os.path.abspath(args.epub_path)
     if not os.path.exists(epub_path):
@@ -232,8 +246,6 @@ def cmd_instructions(args):
 
 def _parse_exercise(exercise_id: str, element) -> dict:
     """Parse exercise content into structured instructions."""
-    from bs4 import Tag
-
     # Extract title
     h2 = element.find('h2')
     if h2:
@@ -395,8 +407,6 @@ def _is_file_content_block(pre) -> bool:
 
 def _extract_filename(element, step_element) -> str:
     """Extract target filename from prose context near a file content block."""
-    from bs4 import Tag
-
     has_content_keyword = False
     found_filename = None
 
@@ -590,6 +600,105 @@ def _parse_code_block(pre) -> list:
     return commands
 
 
+def cmd_summary(args):
+    """Summarize exercise testability — which steps have commands vs GUI-only."""
+    _ensure_bs4()
+
+    epub_path = os.path.abspath(args.epub_path)
+    if not os.path.exists(epub_path):
+        _output({"success": False, "error": f"EPUB not found: {epub_path}"})
+        return
+
+    cache_dir = _epub_cache_dir(epub_path)
+    content_dir = os.path.join(cache_dir, "EPUB")
+    lesson_path = args.lesson_path or str(Path(epub_path).parent)
+
+    exercises = _find_exercises(content_dir, lesson_path)
+    summaries = []
+
+    for ex in exercises:
+        exercise_id = ex["id"]
+
+        # Find exercise section
+        section = None
+        content_path = Path(content_dir)
+        for html_file in sorted(list(content_path.glob("*.xhtml")) + list(content_path.glob("*.html"))):
+            try:
+                with open(html_file, 'r', encoding='utf-8') as f:
+                    soup = BeautifulSoup(f, 'html.parser')
+                for s in soup.find_all('section'):
+                    classes = s.get('class', [])
+                    if not isinstance(classes, list):
+                        classes = classes.split()
+                    if 'sect2' not in classes:
+                        continue
+                    for pre in s.find_all('pre'):
+                        if re.search(rf'lab start(?:\s+-t\s+[\w-]+)?\s+{re.escape(exercise_id)}\b', pre.get_text()):
+                            section = s
+                            break
+                    if section:
+                        break
+            except Exception:
+                continue
+            if section:
+                break
+
+        if not section:
+            summaries.append({"id": exercise_id, "type": ex["type"], "error": "not found in EPUB"})
+            continue
+
+        parsed = _parse_exercise(exercise_id, section)
+
+        def classify_steps(steps):
+            total = 0
+            gui_only = 0
+            with_commands = 0
+            with_files = 0
+            total_cmds = 0
+            total_files = 0
+            for s in steps:
+                total += 1
+                cmds = len(s.get("commands", []))
+                files = len(s.get("file_actions", []))
+                total_cmds += cmds
+                total_files += files
+                if cmds > 0:
+                    with_commands += 1
+                elif files > 0:
+                    with_files += 1
+                else:
+                    gui_only += 1
+                sub = classify_steps(s.get("sub_steps", []))
+                total += sub["total"]
+                gui_only += sub["gui_only"]
+                with_commands += sub["with_commands"]
+                with_files += sub["with_files"]
+                total_cmds += sub["total_commands"]
+                total_files += sub["total_files"]
+            return {
+                "total": total, "gui_only": gui_only,
+                "with_commands": with_commands, "with_files": with_files,
+                "total_commands": total_cmds, "total_files": total_files,
+            }
+
+        stats = classify_steps(parsed.get("steps", []))
+        summaries.append({
+            "id": exercise_id,
+            "type": ex["type"],
+            "title": parsed.get("title", ""),
+            "steps": stats["total"],
+            "gui_only_steps": stats["gui_only"],
+            "command_steps": stats["with_commands"],
+            "file_steps": stats["with_files"],
+            "total_commands": stats["total_commands"],
+            "total_files": stats["total_files"],
+            "has_solutions": len(ex.get("solution_files", [])) > 0,
+            "testable": stats["with_commands"] > 0 or stats["with_files"] > 0,
+        })
+
+    _output({"success": True, "exercises": summaries})
+
+
 def cmd_build(args):
     """Build EPUB via sk."""
     course_path = Path(args.course_path).expanduser().resolve()
@@ -680,6 +789,12 @@ def main():
     p_inst.add_argument("epub_path")
     p_inst.add_argument("exercise_id")
     p_inst.set_defaults(func=cmd_instructions)
+
+    # summary
+    p_summary = subparsers.add_parser("summary")
+    p_summary.add_argument("epub_path")
+    p_summary.add_argument("--lesson-path", default=None)
+    p_summary.set_defaults(func=cmd_summary)
 
     # build
     p_build = subparsers.add_parser("build")

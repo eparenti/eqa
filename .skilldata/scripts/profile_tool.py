@@ -219,13 +219,26 @@ def cmd_build(args):
             real_hosts.append(host)
     profile["real_hosts"] = sorted(real_hosts)
 
-    # Collections
+    # Collections — filter out hostname FQDNs that look like namespace.collection
     collections = set()
+    # Patterns that are hostnames, not Ansible collections
+    hostname_patterns = [
+        r'^server[a-e]\.lab$',
+        r'^[a-z]+\.lab$',         # *.lab.example.com hostnames
+        r'^[a-z]+\.example$',     # *.example.com hostnames
+        r'^console\.redhat$',     # console.redhat.com
+        r'^docs\.ansible$',       # docs.ansible.com
+        r'^galaxy\.ansible$',     # galaxy.ansible.com
+    ]
     for match in re.finditer(r'\b([a-z_]+\.[a-z_]+)\.[a-z_]+\b', text_lower):
         collection = match.group(1)
-        if collection != 'ansible.builtin' and '.' in collection:
-            if not any(collection.startswith(p) for p in ['www.', 'e.g.', 'i.e.', 'lab.example']):
-                collections.add(collection)
+        if collection == 'ansible.builtin':
+            continue
+        if any(collection.startswith(p) for p in ['www.', 'e.g.', 'i.e.']):
+            continue
+        if any(re.match(hp, collection) for hp in hostname_patterns):
+            continue
+        collections.add(collection)
     profile["referenced_collections"] = sorted(collections)
 
     _output(profile)

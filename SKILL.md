@@ -69,7 +69,7 @@ Analyzes EPUB content to detect: technology stack, dev containers, tool location
 python3 ~/git-repos/eqa/.skilldata/scripts/ssh_tool.py lab install <lesson_code>
 ```
 
-Required before exercises can be tested in multi-repo courses.
+Required before exercises can be tested in multi-repo courses. Must be run each time you switch to a different lesson — installing a new lesson replaces the previous one.
 
 ## Test Categories
 
@@ -83,19 +83,25 @@ Execute these in order for each exercise. Use judgment to decide when to skip, r
 
 ### TC-STUDENTSIM: Student Simulation
 
-1. Get instructions: `epub_tool.py instructions <epub> <exercise_id>`
-2. Execute each step's commands via `ssh_tool.py run <command>`
-3. For file actions (type=create), write files via `ssh_tool.py write-file <path> --content <base64>`
-4. For interactive commands, use `ssh_tool.py interactive <cmd> --prompts '<json>'`
-5. Track which steps pass/fail
+1. Run `epub_tool.py summary <epub> --lesson-path <path>` first to see which exercises have commands vs GUI-only steps
+2. Get instructions: `epub_tool.py instructions <epub> <exercise_id>`
+3. Execute each step's commands via `ssh_tool.py run <command>`
+4. For file actions (type=create), write files via `ssh_tool.py write-file <path> --content <base64>`
+5. For interactive commands, use `ssh_tool.py interactive <cmd> --prompts '<json>'`
+6. Track which steps pass/fail
 
-**Dev container exercises:** If the course profile shows `uses_dev_containers`, check for `.devcontainer/` in the exercise directory on workstation. Use `ssh_tool.py devcontainer-start <project_dir>` and run commands via `ssh_tool.py devcontainer-run` instead of `ssh_tool.py run`.
+**ansible-navigator: always add `-m stdout`**. EPUB instructions often say `ansible-navigator run playbook.yml` without `-m stdout`. Without it, ansible-navigator launches an interactive TUI that hangs in non-interactive execution. Always append `-m stdout` when running ansible-navigator commands via ssh_tool.
+
+**VS Code GUI steps are untestable.** Steps like "Click File > New Text File", "Reopen in Container", or "Click Open Folder" have no extractable commands. When an exercise is primarily GUI-based (summary shows `gui_only_steps > command_steps`), use the solution files instead of trying to simulate the GUI steps. The solution files represent the end state the GUI steps would produce.
+
+**Dev container exercises:** If the course profile shows `uses_dev_containers`, check for `.devcontainer/` in the exercise directory on workstation. Use `ssh_tool.py devcontainer-start <project_dir>` and run commands via `ssh_tool.py devcontainer-run` instead of `ssh_tool.py run`. Before starting, run `ssh_tool.py status` to check available disk space — dev containers need ~2GB free for the container image + EE image.
 
 **Interpreting failures:** Not all command failures are bugs. Consider:
 - Verification steps (grep, test) may fail if prior steps had issues
 - Commands that check state may legitimately return non-zero
 - `ansible-navigator` commands may fail due to EE image issues (environment, not exercise bug)
 - Troubleshooting exercises have *intentional* failures
+- EE image pull failures with "no space left on device" are environment issues, not exercise bugs
 
 ### TC-SOL: Solution Files
 
@@ -201,14 +207,17 @@ Write reports to `~/git-repos/eqa/results/`. Use filename pattern: `<exercise-id
 | Subcommand | Description | Key Options |
 |------------|-------------|-------------|
 | `connect` | Start ControlMaster | `--host workstation` |
-| `run <cmd>` | Execute command | `--timeout 120` |
+| `status` | Check connection, framework, disk space | |
+| `run <cmd>` | Execute command (auto-reconnects) | `--timeout 120` |
 | `lab <action> <exercise>` | Framework-aware lab command | `--timeout 300` |
 | `interactive <cmd>` | Interactive command via pexpect | `--prompts '[[pat,resp],...]'` |
 | `write-file <path>` | Write file (base64) | `--content <b64>` |
 | `read-file <path>` | Read remote file | |
-| `devcontainer-start <dir>` | Parse devcontainer.json, start | |
+| `devcontainer-start <dir>` | Parse devcontainer.json, start (checks disk) | |
 | `devcontainer-run <cmd>` | Execute in container | `--workdir`, `--user` |
 | `devcontainer-stop` | Stop container | |
+| `autotest` | DynoLabs 5 autotest (Rust CLI) | `--ignore-errors`, `--timeout 1800` |
+| `coursetest` | DynoLabs 5 coursetest (Rust CLI) | `--dry-run`, `--timeout 3600` |
 | `disconnect` | Tear down connection | |
 
 ### epub_tool.py
@@ -217,6 +226,7 @@ Write reports to `~/git-repos/eqa/results/`. Use filename pattern: `<exercise-id
 |------------|-------------|-------------|
 | `parse <epub>` | Extract course structure | `--lesson-path <path>` |
 | `instructions <epub> <id>` | Get exercise steps | |
+| `summary <epub>` | Testability overview per exercise | `--lesson-path <path>` |
 | `build <course_path>` | Build EPUB via sk | `--force` |
 
 ### course_tool.py
@@ -253,18 +263,32 @@ Some courses run tools inside podman containers instead of directly on workstati
 5. `lab` commands still run on workstation (not in container)
 6. Clean up with `devcontainer-stop` before `lab finish`
 
-### ansible-navigator Translation
+### ansible-navigator Commands
 
-When the EPUB says `ansible-navigator run playbook.yml -m stdout`, that exact command should be used. Do NOT translate to `ansible-playbook`. The course profile tells you which tool the course expects.
+When running `ansible-navigator` via ssh_tool (non-interactively), **always append `-m stdout`** to prevent the interactive TUI from launching. The EPUB may or may not include this flag — add it regardless.
+
+```bash
+# EPUB says:          ansible-navigator run site.yml
+# You should run:     ansible-navigator run site.yml -m stdout
+
+# EPUB says:          ansible-navigator inventory -i inventory --list
+# You should run:     ansible-navigator inventory -i inventory --list -m stdout
+```
+
+Do NOT translate `ansible-navigator` to `ansible-playbook`. The course profile tells you which tool the course expects.
 
 ## Decision Points
 
 - **Lab start fails with "another lab is running"**: ssh_tool handles this automatically by finishing the blocking lab
 - **Command times out**: Retry once with 2x timeout. If still fails, record as P2 and continue
-- **SSH drops mid-test**: Run `ssh_tool.py connect` again to re-establish. The ControlMaster will reconnect
+- **SSH drops mid-test**: ssh_tool auto-reconnects on stale sockets. If that fails, run `ssh_tool.py connect` again
 - **Exercise not found in EPUB**: Check for fuzzy matches (the exercise ID in instructions may differ from what was requested)
 - **Grade passes without solution**: This is a P1 bug, not a false alarm. DynoLabs grading SHOULD fail when student hasn't done the work
 - **All steps pass but grade fails**: Check if solution files need to be applied differently, or if grading checks something the instructions don't cover
+- **EE image pull fails "no space left on device"**: Environment issue. Run `podman system prune -af` and `rm -rf ~/.cache/uv` on workstation. If still insufficient, note as environment blocker
+- **Exercise is all GUI steps**: Use solution files to set up the expected state, then test the verification/command steps that follow
+- **ansible-navigator hangs**: Missing `-m stdout` flag. Always append it for non-interactive execution
+- **Switching lessons in multi-repo course**: Must run `lab install <new-lesson>` before testing exercises in a different lesson
 
 ## Cleanup
 
