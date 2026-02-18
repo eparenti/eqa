@@ -381,8 +381,33 @@ def _parse_step(li, number: str) -> dict:
 
 def _is_file_content_block(pre) -> bool:
     """Check if a <pre> block contains file content (not a command)."""
-    if pre.find('strong'):
-        return False
+    # In command blocks, <strong> wraps what the student types at a prompt.
+    # In file content blocks, <strong> highlights new/changed lines.
+    # Distinguish by checking the full block context, not just the strong text.
+    strong_tags = pre.find_all('strong')
+    if strong_tags:
+        full_text = pre.get_text()
+        first_line = full_text.strip().split('\n')[0].strip() if full_text else ''
+
+        # If the block starts with a shell prompt, it's a command block
+        prompt_indicators = [r'^[\$#]\s', r'^\[.*@.*\][\$#]', r'^student@', r'^root@', r'^➜']
+        for p in prompt_indicators:
+            if re.match(p, first_line):
+                return False
+
+        # If the strong text IS the entire meaningful content (typical of commands),
+        # and it doesn't look like config/YAML, treat as command
+        strong_text = ' '.join(s.get_text(strip=True) for s in strong_tags)
+        non_strong_text = full_text.replace(strong_text, '').strip()
+
+        # Command blocks: strong text is the command, non-strong is just prompt/output
+        # File content blocks: strong text is a highlighted portion of larger content
+        if not non_strong_text or len(non_strong_text) < len(strong_text) * 0.3:
+            # Strong text dominates — likely a command block
+            return False
+
+        # If we get here, the block has substantial non-strong content alongside
+        # strong content — this is file content with highlighted changes
 
     text = pre.get_text()
     if not text or not text.strip():
@@ -430,15 +455,21 @@ def _extract_filename(element, step_element) -> str:
     file_extensions = (
         '.yml', '.yaml', '.json', '.cfg', '.conf', '.ini', '.txt',
         '.py', '.sh', '.j2', '.jinja2', '.html', '.xml', '.toml', '.repo',
+        '.fact', '.rules', '.te', '.pp', '.service', '.timer', '.socket',
     )
 
     def find_filename_in(elem):
         candidates = []
         for code in elem.find_all('code', class_='literal'):
             code_text = code.get_text(strip=True)
+            # Skip FQCN module paths (e.g., ansible.builtin.service)
             if code_text.count('.') > 1:
                 continue
+            # Match files with known extensions
             if any(code_text.endswith(ext) for ext in file_extensions):
+                candidates.append(code_text)
+            # Match dotfiles (.cert_pass, .web_pass, .gitignore, etc.)
+            elif code_text.startswith('.') and len(code_text) > 1 and '/' not in code_text:
                 candidates.append(code_text)
         return candidates[-1] if candidates else None
 
@@ -476,6 +507,36 @@ def _extract_filename(element, step_element) -> str:
             if fn:
                 return fn
 
+    # Strategy 3: Check following siblings of the element.
+    # Pattern: step says "add the following content" (file block here),
+    # next step says "Save the file as X.yml" (filename there).
+    for sibling in element.next_siblings:
+        if not isinstance(sibling, Tag):
+            continue
+        if sibling.name == 'figure':
+            break
+        fn = find_filename_in(sibling)
+        if fn:
+            sib_text = sibling.get_text().lower()
+            if any(kw in sib_text for kw in ['save', 'name', 'file as']):
+                return fn
+
+    # Strategy 4: Check ancestor steps for the filename.
+    # Pattern: parent step says "Create a playbook named X.yml",
+    # sub-step has the content block.
+    node = step_element.parent
+    while node:
+        if node.name == 'li':
+            ancestor_principal = node.find(class_='principal', recursive=False)
+            if ancestor_principal:
+                fn = find_filename_in(ancestor_principal)
+                if fn:
+                    return fn
+        node = node.parent
+        # Don't go past section boundaries
+        if node and node.name == 'section':
+            break
+
     return None
 
 
@@ -485,10 +546,9 @@ def _parse_file_block(pre, filename: str) -> dict:
     if not content or not content.strip():
         return None
 
-    # Check for partial content
+    # Check for partial content (output omitted markers)
     has_omission = bool(pre.find('em', string=re.compile(r'output omitted', re.IGNORECASE)))
-    if has_omission:
-        return None
+    action_type = "modify" if has_omission else "create"
 
     lines = content.split('\n')
     while lines and not lines[0].strip():
@@ -512,7 +572,7 @@ def _parse_file_block(pre, filename: str) -> dict:
     return {
         "filename": filename,
         "content": content,
-        "action_type": "create",
+        "action_type": action_type,
     }
 
 
@@ -535,6 +595,9 @@ def _parse_code_block(pre) -> list:
         if cmd_text in skip_patterns:
             continue
         if cmd_text.startswith('- ') or cmd_text.startswith('key:') or cmd_text.startswith('value:'):
+            continue
+        # Skip config file directives (key = value patterns from ansible.cfg etc.)
+        if re.match(r'^[a-z_]+\s*=\s*\S', cmd_text):
             continue
         if '@' in cmd_text and ' ' not in cmd_text and len(cmd_text) < 20:
             continue
@@ -576,10 +639,14 @@ def _parse_code_block(pre) -> list:
         if full_cmd:
             final_commands.append(full_cmd)
 
-    # Check for interactive prompts
+    # Check for interactive prompts (login, vault passwords)
     is_interactive = False
     prompts = []
     parent_text = pre.get_text()
+
+    # Collect all password/prompt responses from the code block context
+    prompt_responses = set()
+
     if 'Username:' in parent_text or 'Password:' in parent_text:
         is_interactive = True
         for pattern, prompt in [
@@ -589,8 +656,34 @@ def _parse_code_block(pre) -> list:
             match = re.search(pattern, parent_text)
             if match:
                 prompts.append([prompt, match.group(1)])
+                prompt_responses.add(match.group(1))
 
+    # Detect ansible-vault password prompts
+    # Pattern: "New vault password (id): PASSWORD" or "Confirm new vault password (id): PASSWORD"
+    vault_prompt_pattern = r'(?:New vault password|Confirm new vault password|Vault password)\s*(?:\([^)]+\))?:\s*(\S+)'
+    vault_matches = re.findall(vault_prompt_pattern, parent_text)
+    if vault_matches:
+        is_interactive = True
+        for pw in vault_matches:
+            prompt_responses.add(pw)
+        # Build prompt pairs for vault
+        seen_prompts = set()
+        for m in re.finditer(vault_prompt_pattern, parent_text):
+            prompt_text = m.group(0).split(':')[0].strip() + ':'
+            response = m.group(1)
+            key = (prompt_text, response)
+            if key not in seen_prompts:
+                prompts.append([re.escape(prompt_text.split('(')[0].strip()), response])
+                seen_prompts.add(key)
+
+    # Filter out bare password strings that were extracted as "commands"
+    filtered_commands = []
     for cmd_text in final_commands:
+        if cmd_text in prompt_responses:
+            continue
+        filtered_commands.append(cmd_text)
+
+    for cmd_text in filtered_commands:
         commands.append({
             "text": cmd_text,
             "is_interactive": is_interactive,
