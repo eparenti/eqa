@@ -143,8 +143,15 @@ Then execute step by step:
 | "Create .xxx_pass containing PASSWORD" | `ssh_tool.py write-file` + `chmod 600` |
 | "Add line to ansible.cfg" | Read ansible.cfg, add line, write back |
 | "Open browser to URL" | `web_tool.py navigate <url>` or `curl` |
-| "Click button / fill form" | `web_tool.py click` / `web_tool.py fill` |
+| "Click button / fill form" | `web_tool.py click <selector>` / `web_tool.py fill <selector> <value>` |
+| "Log in to the web console" | `web_tool.py fill "#inputUsername" "user"` + `web_tool.py fill "#inputPassword" "pass"` + `web_tool.py click "button[type='submit']"` |
+| "Verify page shows X" | `web_tool.py page-text` and check for expected content |
+| "Take screenshot" | `web_tool.py screenshot /tmp/screenshot.png` |
+| "Navigate to VM list" | `web_tool.py navigate "https://console.../k8s/ns/<project>/kubevirt.io~v1~VirtualMachine"` |
 | AAP Controller UI actions | `rht-labs-aapcli` or Controller REST API via `web_tool.py api-get/api-post` |
+| OCP web console: Add disk to VM | `oc` create PVC + `virtctl addvolume` + restart VM |
+| OCP web console: Create project | `oc new-project <name>` |
+| OCP web console: Check resource status | `oc get <resource> -n <project>` |
 
 **ansible-vault commands:** Rewrite interactive vault commands to non-interactive form:
 - `ansible-vault encrypt file` → `ansible-vault encrypt --vault-password-file /tmp/pass file` (write password to temp file first)
@@ -283,16 +290,32 @@ Check for security anti-patterns in exercise content:
 
 Note: Many exercises intentionally use simple credentials for teaching purposes. Only flag security issues that teach bad habits students might carry to production.
 
-### TC-WEB: Web Application Testing
+### TC-WEB: Web Application and Web Console Testing
 
-For exercises that deploy or interact with web applications:
+For exercises that deploy web applications or use web consoles (OpenShift, AAP Controller, Satellite):
 
+**Web application verification:**
 1. Use `web_tool.py navigate <url>` to verify deployed applications are accessible
 2. Use `web_tool.py page-text` to verify page content matches expectations
 3. Use `web_tool.py screenshot <path>` to capture visual state for review
-4. For AAP Controller: use `rht-labs-aapcli` or `web_tool.py api-get/api-post` to validate API state
-5. Application not reachable after deployment: **P1 bug**
-6. Application shows wrong content: **P2 bug**
+4. Application not reachable after deployment: **P1 bug**
+5. Application shows wrong content: **P2 bug**
+
+**OpenShift web console testing:**
+1. Navigate to the console URL (typically `https://console-openshift-console.apps.ocp4.example.com`)
+2. Log in: `fill "#inputUsername"` + `fill "#inputPassword"` + `click "button[type='submit']"`
+3. Navigate to specific pages using direct URLs:
+   - VMs: `/k8s/ns/<project>/kubevirt.io~v1~VirtualMachine`
+   - Pods: `/k8s/ns/<project>/pods`
+   - Storage: `/k8s/ns/<project>/persistentvolumeclaims`
+4. Use `page-text` to verify resource status
+5. Use `screenshot` to capture console state for reports
+6. For actions (create, delete, modify), prefer `oc` CLI — it's faster and more reliable than clicking through the console
+
+**AAP Controller:**
+- Use `rht-labs-aapcli` at `~/git-repos/active/rht-labs-aapcli` for API operations
+- Or use `web_tool.py api-get/api-post` for direct REST API calls
+- Controller URL is typically `https://controller.example.com` or as specified in the exercise
 
 ## Bug Severity
 
@@ -527,6 +550,61 @@ The skill auto-detects 3 course patterns from `outline.yml`:
 - `outline.yml` has `course:` root key
 - Materials at `content/{chapter-keyword}/`
 
+### OpenShift / Kubernetes Courses (DO*)
+
+These courses use `oc` and `kubectl` commands, virtual machines via OpenShift Virtualization, and the OpenShift web console.
+
+**Lab environment setup:**
+1. The workstation must be provisioned with an OCP cluster image (check `cat /etc/rht` for `RHT_COURSE` and `RHT_VMTREE`)
+2. The lab manifest (`~/.grading/lab_manifest.json`) lists which exercise SKUs are available
+3. Run `lab install <lesson-sku>` to install grading packages for each lesson — the SKU is the lowercase lesson code (e.g., `do0024l`)
+4. If `lab install` fails with "not part of this course curriculum", the workstation image doesn't include that course. Check `lab list` for available SKUs
+
+**DynoLabs package installation:**
+- Each lesson has a Python grading package in `classroom/grading/` with a `pyproject.toml`
+- `lab install <sku>` uses `uv` to install the package from the Red Hat Training PyPI mirror
+- The package depends on `rht-labs-core` (the DynoLabs framework) and course-specific libraries (e.g., `rht-labs-ocpvirt` for OpenShift Virtualization)
+- The lab manifest maps exercise names to their lesson SKU and version
+
+**Storage classes:**
+- Before creating PVCs, always check available storage classes: `oc get sc`
+- Different clusters use different storage backends (Ceph RBD, LVMS, etc.)
+- Use the default storage class or the one the exercise specifies
+- Common pattern: `ocs-external-storagecluster-ceph-rbd-virtualization` for VM disks
+
+**Virtual machine operations:**
+- `virtctl console <vm>` is interactive — use `virtctl ssh <user>@<vm> --command '<cmd>' -l <user> --known-hosts=` for non-interactive execution
+- VM disk attachment requires stop → modify → start cycle (the web console does this automatically)
+- To add a disk programmatically: create PVC with correct storage class, then `virtctl addvolume <vm> --volume-name=<pvc> --persist`, then restart the VM
+- Wait for VMs to be in `Running` status before connecting: `oc get vm -n <project>`
+
+**Web console testing with Playwright:**
+Many OCP exercises use the web console (console-openshift-console.apps.ocp4.example.com). Use `web_tool.py` to automate:
+
+```bash
+# Navigate to web console
+web_tool.py navigate "https://console-openshift-console.apps.ocp4.example.com"
+
+# Login
+web_tool.py fill "#inputUsername" "developer"
+web_tool.py fill "#inputPassword" "developer"
+web_tool.py click "button[type='submit']"
+
+# Navigate to VirtualMachines
+web_tool.py navigate "https://console-openshift-console.apps.ocp4.example.com/k8s/ns/storage-intro/kubevirt.io~v1~VirtualMachine"
+
+# Verify VM status
+web_tool.py page-text
+
+# Take screenshot for visual verification
+web_tool.py screenshot "/tmp/ocp-console.png"
+```
+
+For actions that have CLI equivalents, prefer `oc` commands over Playwright — they're faster and more reliable. Use Playwright for:
+- Verifying the web console shows the correct state (visual verification)
+- Testing web console-specific workflows that have no CLI equivalent
+- Taking screenshots for QA reports
+
 ### Dev Container Exercises
 
 Some courses run tools inside podman containers instead of directly on workstation.
@@ -566,6 +644,11 @@ Do NOT translate `ansible-navigator` to `ansible-playbook`. The course profile t
 - **ansible-navigator hangs**: Missing `-m stdout` flag. Always append it for non-interactive execution
 - **AAP Controller web UI steps**: Use `rht-labs-aapcli` or Controller REST API via `web_tool.py api-get/api-post`
 - **Switching lessons in multi-repo course**: Must run `lab install <new-lesson>` before testing exercises in a different lesson
+- **`lab install` fails "not part of this course curriculum"**: The workstation image doesn't include this course's manifest. Check `cat /etc/rht` for `RHT_COURSE` and `lab list` for available SKUs. The workstation may be provisioned for a different course
+- **OCP exercise needs storage**: Always run `oc get sc` first to find the right storage class. Don't hardcode storage class names
+- **`virtctl console` hangs**: Use `virtctl ssh --command` instead for non-interactive VM access
+- **VM disk not visible after attach**: The VM needs a restart. Stop → add volume → start
+- **OCP web console steps**: Prefer `oc` CLI equivalents for reliability. Use `web_tool.py` Playwright for visual verification and web-console-only workflows
 - **Network device exercises**: Apply 2x timeout multiplier for all SSH/device commands
 - **Troubleshooting exercise**: Check `exercises_with_deliberate_bugs` in profile — failures may be intentional
 
