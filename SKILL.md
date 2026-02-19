@@ -150,6 +150,30 @@ ssh_tool.py lab grade <exercise>
 - Use `lab version` to see the installed package version vs the EPUB's `pyproject.toml` version
 - Use `lab force <sku>` to install the correct version matching the EPUB
 
+### 6. Network Tunnel (for web UI testing)
+
+To access classroom web UIs (OCP console, AAP Controller, Satellite, deployed web apps) from the local machine for Playwright testing or `curl` verification, set up a network tunnel via sshuttle.
+
+**a) Get the classroom subnets:**
+```bash
+ssh_tool.py status
+```
+The `subnets` field in the output lists the classroom networks (e.g., `["172.25.250.0/24", "192.168.50.0/24"]`).
+
+**b) Start sshuttle:**
+
+`sshuttle` requires sudo. Ask the user to run the command in a separate terminal:
+```bash
+sudo sshuttle --dns -r workstation <subnet1> <subnet2> ... -D
+```
+
+**c) Verify connectivity:**
+```bash
+curl -sk -o /dev/null -w '%{http_code}' https://<any-classroom-url>/
+```
+
+This step is **optional** — only needed for TC-WEB testing with Playwright or direct `curl` from the local machine. If skipped, use `ssh_tool.py run "curl ..."` to access web services via the workstation instead.
+
 ## Test Categories
 
 Execute these for each exercise. Collect ALL bugs before reporting (error summary pattern — don't fail-fast). The order below is the recommended sequence, but use judgment to skip or adapt based on context.
@@ -211,7 +235,7 @@ Then execute step by step:
 | "Add line to ansible.cfg" | Read ansible.cfg, add line, write back |
 | "Open browser to URL" | `web_tool.py navigate <url>` or `curl` |
 | "Click button / fill form" | `web_tool.py click <selector>` / `web_tool.py fill <selector> <value>` |
-| "Log in to the web console" | `web_tool.py fill "#inputUsername" "user"` + `web_tool.py fill "#inputPassword" "pass"` + `web_tool.py click "button[type='submit']"` |
+| "Log in to the web console" | `web_tool.py login <console-url> --username <user> --password <pass> --then <target-url>` |
 | "Verify page shows X" | `web_tool.py page-text` and check for expected content |
 | "Take screenshot" | `web_tool.py screenshot /tmp/screenshot.png` |
 | "Navigate to VM list" | `web_tool.py navigate "https://console.../k8s/ns/<project>/kubevirt.io~v1~VirtualMachine"` |
@@ -361,23 +385,46 @@ Note: Many exercises intentionally use simple credentials for teaching purposes.
 
 For exercises that deploy web applications or use web consoles (OpenShift, AAP Controller, Satellite):
 
-**Web application verification:**
-1. Use `web_tool.py navigate <url>` to verify deployed applications are accessible
-2. Use `web_tool.py page-text` to verify page content matches expectations
-3. Use `web_tool.py screenshot <path>` to capture visual state for review
-4. Application not reachable after deployment: **P1 bug**
-5. Application shows wrong content: **P2 bug**
+**Verification methods (in order of preference):**
 
-**OpenShift web console testing:**
-1. Navigate to the console URL (typically `https://console-openshift-console.apps.ocp4.example.com`)
-2. Log in: `fill "#inputUsername"` + `fill "#inputPassword"` + `click "button[type='submit']"`
-3. Navigate to specific pages using direct URLs:
-   - VMs: `/k8s/ns/<project>/kubevirt.io~v1~VirtualMachine`
-   - Pods: `/k8s/ns/<project>/pods`
-   - Storage: `/k8s/ns/<project>/persistentvolumeclaims`
-4. Use `page-text` to verify resource status
-5. Use `screenshot` to capture console state for reports
-6. For actions (create, delete, modify), prefer `oc` CLI — it's faster and more reliable than clicking through the console
+1. **`oc` CLI** — fastest and most reliable for resource state verification:
+   ```bash
+   ssh_tool.py run "oc get vm -n <ns>"              # VM status
+   ssh_tool.py run "oc get pvc -n <ns>"             # Storage state
+   ssh_tool.py run "oc get route -n <ns>"           # Route/URL info
+   ssh_tool.py run "oc get pods -n <ns>"            # Pod status
+   ```
+
+2. **`curl` from workstation** — verify web apps are reachable and return expected content:
+   ```bash
+   ssh_tool.py run "curl -sk https://<route-url>/"  # Check web app response
+   ssh_tool.py run "curl -sk -o /dev/null -w '%{http_code}' https://<url>"  # Just status code
+   ```
+
+3. **`web_tool.py api-get/api-post`** — REST API verification (no Playwright needed):
+   ```bash
+   web_tool.py api-get "https://<url>/api/v1/..." --headers '{"Authorization": "Bearer <token>"}'
+   ```
+
+4. **`web_tool.py` with Playwright** — full browser testing (requires `pip install playwright && playwright install chromium` and sshuttle tunnel — see Setup Step 6).
+
+   With the tunnel active, use web_tool.py locally:
+   ```bash
+   # Login and navigate to a page in one session (important: use the console URL, not the OAuth URL)
+   web_tool.py login "https://console-openshift-console.apps.ocp4.example.com" \
+     --username admin --password redhatocp \
+     --then "https://console-openshift-console.apps.ocp4.example.com/k8s/ns/<ns>/kubevirt.io~v1~VirtualMachine" \
+     --screenshot "/tmp/ocp.png"
+   ```
+   The `login` command handles the full OAuth redirect chain in a single browser session. **Always use the console URL** (not the OAuth authorize URL) — the console redirects to OAuth automatically and maintains proper state.
+
+**When to use each method:**
+- Resource existence and status → `oc` CLI (always available)
+- Web app returns correct content → `curl` from workstation
+- REST API responses → `web_tool.py api-get/api-post`
+- Visual verification, form submissions, console-only workflows → Playwright (if available)
+- Application not reachable after deployment: **P1 bug**
+- Application shows wrong content: **P2 bug**
 
 **AAP Controller:**
 - Use `rht-labs-aapcli` at `~/git-repos/active/rht-labs-aapcli` for API operations
@@ -543,6 +590,7 @@ Write reports to `~/git-repos/eqa/results/`. Use filename pattern: `<exercise-id
 | `run <cmd>` | Execute command (auto-reconnects) | `--timeout 120` |
 | `lab <action> <exercise>` | Framework-aware lab command (start/finish/grade/install/solve/force) | `--timeout 600` |
 | `vm-exec <vm>` | Run command inside a KubeVirt VM (tries SSH, falls back to console) | `-n <ns>`, `-c <cmd>`, `--user`, `--password` |
+| `vm-disks <vm>` | List VM disk attachments via virsh (parsed JSON) | `-n <ns>` |
 | `interactive <cmd>` | Interactive command via pexpect | `--prompts '[[pat,resp],...]'` |
 | `write-file <path>` | Write file (base64) | `--content <b64>` |
 | `read-file <path>` | Read remote file | |
@@ -579,6 +627,7 @@ Write reports to `~/git-repos/eqa/results/`. Use filename pattern: `<exercise-id
 
 | Subcommand | Description | Key Options |
 |------------|-------------|-------------|
+| `login <url>` | Login to web app (fill + submit in one session) | `--username`, `--password`, `--then <url>`, `--screenshot` |
 | `navigate <url>` | Open URL in headless browser | `--screenshot <path>` |
 | `click <selector>` | Click element | `--screenshot <path>` |
 | `fill <selector> <value>` | Fill form field | |
@@ -648,31 +697,100 @@ These courses use `oc` and `kubectl` commands, virtual machines via OpenShift Vi
 - Use `ssh_tool.py vm-exec <vm> -n <ns> -c <cmd>` to run commands inside VMs. It auto-detects the auth method (SSH keys vs password) and falls back to serial console when needed.
 - Check the course profile's `vm_auth` field: `"ssh_keys"` means `virtctl ssh` works directly, `"password"` means the VMs use password auth via the VNC/serial console. The `vm_default_password` field contains the password if detected.
 - `virtctl console <vm>` is interactive — use `ssh_tool.py vm-exec` or `virtctl ssh <user>@<vm> --command '<cmd>' -l <user> --known-hosts=` for non-interactive execution
-- VM disk attachment requires stop → modify → start cycle (the web console does this automatically)
-- To add a disk programmatically: create PVC with correct storage class, then `virtctl addvolume <vm> --volume-name=<pvc> --persist`, then restart the VM
 - Wait for VMs to be in `Running` status before connecting: `oc get vm -n <project>`
+- Verify disk state from outside the VM using `virsh domblklist` via the virt-launcher pod:
+  ```bash
+  oc exec -n <ns> $(oc get pods -n <ns> -l vm.kubevirt.io/name=<vm> --no-headers -o name) -- virsh domblklist 1
+  ```
+
+**Adding disks to VMs (programmatic equivalent of web console "Add disk"):**
+
+The web console's "Add disk" creates a DataVolume and patches the VM spec. To replicate this programmatically:
+
+1. **Create a DataVolume** for the disk:
+```bash
+ssh_tool.py run "cat <<'EOF' | oc apply -f -
+apiVersion: cdi.kubevirt.io/v1beta1
+kind: DataVolume
+metadata:
+  name: <disk-name>
+  namespace: <ns>
+spec:
+  source:
+    blank: {}
+  storage:
+    accessModes: [ReadWriteMany]
+    resources:
+      requests:
+        storage: <size>   # e.g. 5Gi
+    storageClassName: <sc> # e.g. ocs-external-storagecluster-ceph-rbd-virtualization
+    volumeMode: Block      # Block for RBD, Filesystem for NFS
+EOF"
+```
+
+2. **Wait for the DataVolume to be ready:**
+```bash
+ssh_tool.py run "oc wait dv/<disk-name> -n <ns> --for=condition=Ready --timeout=120s"
+```
+
+3a. **Attach with virtio interface** (VM must be stopped):
+```bash
+ssh_tool.py run "virtctl stop <vm> -n <ns>"
+# Wait for stop, then patch VM spec to add disk + volume
+ssh_tool.py run "oc patch vm <vm> -n <ns> --type=json -p '[
+  {\"op\":\"add\",\"path\":\"/spec/template/spec/domain/devices/disks/-\",\"value\":{\"name\":\"<disk-name>\",\"disk\":{\"bus\":\"virtio\"}}},
+  {\"op\":\"add\",\"path\":\"/spec/template/spec/volumes/-\",\"value\":{\"name\":\"<disk-name>\",\"dataVolume\":{\"name\":\"<disk-name>\"}}}
+]'"
+ssh_tool.py run "virtctl start <vm> -n <ns>"
+```
+Note: If the `disks` array doesn't exist in the VM spec, use `"op":"add","path":"/spec/template/spec/domain/devices/disks","value":[...]` to create it.
+
+3b. **Hot-plug with SCSI interface** (VM can stay running):
+```bash
+ssh_tool.py run "virtctl addvolume <vm> --volume-name=<disk-name> --disk-type=disk --persist -n <ns>"
+```
+Hot-plugged disks appear as `sda`/`sdb`/`sdc` (SCSI), not `vdX` (virtio).
+
+**Detaching disks from VMs:**
+
+- **Hot-plugged disks** (added via `virtctl addvolume`):
+  ```bash
+  ssh_tool.py run "virtctl removevolume <vm> --volume-name=<disk-name> --persist -n <ns>"
+  ```
+
+- **Original VM spec disks** (not hot-pluggable): Must use `oc patch` to remove from ALL three locations — `disks[]`, `volumes[]`, and `dataVolumeTemplates[]` — in a single patch. The VM must be stopped.
+  ```bash
+  # First, find the indexes:
+  ssh_tool.py run "oc get vm <vm> -n <ns> -o json | python3 -c '
+  import sys,json; vm=json.load(sys.stdin)
+  for i,d in enumerate(vm[\"spec\"][\"template\"][\"spec\"][\"domain\"][\"devices\"].get(\"disks\",[])):
+      print(f\"disk {i}: {d[\"name\"]}\")
+  for i,v in enumerate(vm[\"spec\"][\"template\"][\"spec\"][\"volumes\"]):
+      print(f\"vol  {i}: {v[\"name\"]}\")
+  for i,t in enumerate(vm[\"spec\"].get(\"dataVolumeTemplates\",[])):
+      print(f\"dvt  {i}: {t[\"metadata\"][\"name\"]}\")
+  '"
+  # Then remove by index (use the correct indexes for the disk to remove):
+  ssh_tool.py run "oc patch vm <vm> -n <ns> --type=json -p '[
+    {\"op\":\"remove\",\"path\":\"/spec/template/spec/domain/devices/disks/<disk-idx>\"},
+    {\"op\":\"remove\",\"path\":\"/spec/template/spec/volumes/<vol-idx>\"},
+    {\"op\":\"remove\",\"path\":\"/spec/dataVolumeTemplates/<dvt-idx>\"}
+  ]'"
+  ```
+  All three removals must be in the same patch — removing a volume without its dataVolumeTemplate will be rejected by the API.
 
 **Web console testing with Playwright:**
 Many OCP exercises use the web console (console-openshift-console.apps.ocp4.example.com). Use `web_tool.py` to automate:
 
 ```bash
-# Navigate to web console
-web_tool.py navigate "https://console-openshift-console.apps.ocp4.example.com"
-
-# Login
-web_tool.py fill "#inputUsername" "developer"
-web_tool.py fill "#inputPassword" "developer"
-web_tool.py click "button[type='submit']"
-
-# Navigate to VirtualMachines
-web_tool.py navigate "https://console-openshift-console.apps.ocp4.example.com/k8s/ns/storage-intro/kubevirt.io~v1~VirtualMachine"
-
-# Verify VM status
-web_tool.py page-text
-
-# Take screenshot for visual verification
-web_tool.py screenshot "/tmp/ocp-console.png"
+# Login to OCP console and navigate to VMs page (single session)
+web_tool.py login "https://console-openshift-console.apps.ocp4.example.com" \
+  --username admin --password redhatocp \
+  --then "https://console-openshift-console.apps.ocp4.example.com/k8s/ns/storage-intro/kubevirt.io~v1~VirtualMachine" \
+  --screenshot "/tmp/ocp-console.png"
 ```
+
+**Important:** Always use the console URL as the login target, NOT the OAuth authorize URL. The console handles the OAuth redirect chain automatically, maintaining proper state tokens.
 
 For actions that have CLI equivalents, prefer `oc` commands over Playwright — they're faster and more reliable. Use Playwright for:
 - Verifying the web console shows the correct state (visual verification)

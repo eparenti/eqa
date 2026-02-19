@@ -33,9 +33,10 @@ STATE_FILE = "/tmp/eqa-ssh-state.json"
 
 def _strip_ansi(text: str) -> str:
     """Strip ANSI escape codes, spinner lines, and control characters from output."""
-    text = re.sub(r'\x1b\[[0-9;]*[A-Za-z]', '', text)
-    text = re.sub(r'\x1b\][^\x07]*\x07', '', text)
-    text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', text)
+    text = re.sub(r'\x1b\[[0-9;?]*[A-Za-z]', '', text)  # CSI sequences (including ?2004h/l)
+    text = re.sub(r'\x1b\][^\x07]*\x07', '', text)       # OSC sequences
+    text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', text)  # control chars
+    text = text.replace('\r\n', '\n').replace('\r', '\n')  # normalize line endings
     # Strip DynoLabs spinner lines (e.g., "   -    Checking lab systems")
     # These are progress indicator lines with spinner chars (- \ | /) followed by the step name.
     # Keep only the final SUCCESS/FAIL/PASS line for each step.
@@ -252,6 +253,18 @@ def cmd_status(args):
             )
             if disk.returncode == 0:
                 result["disk_free"] = disk.stdout.strip()
+        except Exception:
+            pass
+
+        # Get classroom subnets
+        try:
+            nets = subprocess.run(
+                ['ssh'] + _ssh_opts(state) + [state["host"],
+                 "ip route | grep -v default | awk '{print $1}' | grep -v '^10\\.88\\.'"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if nets.returncode == 0:
+                result["subnets"] = [s.strip() for s in nets.stdout.strip().split('\n') if s.strip()]
         except Exception:
             pass
 
@@ -485,6 +498,98 @@ def cmd_interactive(args):
         })
 
 
+def cmd_vm_disks(args):
+    """List disks attached to a KubeVirt VM via virsh domblklist.
+
+    Returns parsed disk info as JSON array.
+    """
+    state = _load_state()
+    if not state:
+        _output({"success": False, "error": "Not connected. Run 'connect' first."})
+        return
+
+    vm_name = args.vm_name
+    namespace = args.namespace
+    timeout = args.timeout
+
+    start_time = time.time()
+
+    # Get the virt-launcher pod name
+    pod_cmd = (
+        f"oc get pods -n {namespace} -l vm.kubevirt.io/name={vm_name} "
+        f"--no-headers -o custom-columns=':metadata.name' 2>&1"
+    )
+    try:
+        result = subprocess.run(
+            ['ssh'] + _ssh_opts(state) + [state["host"], pod_cmd],
+            capture_output=True, text=True, timeout=30,
+        )
+        pod_name = result.stdout.strip()
+        if not pod_name or result.returncode != 0:
+            _output({
+                "success": False,
+                "error": f"No virt-launcher pod found for VM {vm_name} in {namespace}",
+                "duration": round(time.time() - start_time, 2),
+            })
+            return
+
+        # Run virsh domblklist
+        virsh_cmd = f"oc exec -n {namespace} {pod_name} -- virsh domblklist 1 2>&1"
+        result = subprocess.run(
+            ['ssh'] + _ssh_opts(state) + [state["host"], virsh_cmd],
+            capture_output=True, text=True, timeout=timeout,
+        )
+        stdout = _strip_ansi(result.stdout)
+
+        # Parse the virsh output into structured data
+        disks = []
+        for line in stdout.strip().split('\n'):
+            line = line.strip()
+            if not line or line.startswith('Target') or line.startswith('---'):
+                continue
+            parts = line.split(None, 1)
+            if len(parts) == 2:
+                target, source = parts
+                disk_type = "unknown"
+                if '/hotplug-disks/' in source:
+                    disk_type = "hotplug"
+                elif '/vmi-disks/' in source:
+                    disk_type = "persistent"
+                elif source.startswith('/dev/'):
+                    disk_type = "block"
+                elif 'cloud-init' in source or 'noCloud' in source:
+                    disk_type = "cloudinit"
+                # Extract volume name from source path
+                vol_name = source.rsplit('/', 1)[-1] if '/' in source else source
+                if vol_name == 'disk.img':
+                    vol_name = source.rsplit('/', 2)[-2] if source.count('/') >= 2 else vol_name
+                disks.append({
+                    "target": target,
+                    "source": source,
+                    "type": disk_type,
+                    "volume": vol_name,
+                })
+
+        _output({
+            "success": result.returncode == 0,
+            "disks": disks,
+            "raw": stdout,
+            "duration": round(time.time() - start_time, 2),
+        })
+    except subprocess.TimeoutExpired:
+        _output({
+            "success": False,
+            "error": f"Timed out after {timeout}s",
+            "duration": timeout,
+        })
+    except Exception as e:
+        _output({
+            "success": False,
+            "error": str(e),
+            "duration": round(time.time() - start_time, 2),
+        })
+
+
 def cmd_vm_exec(args):
     """Execute a command inside a KubeVirt VM.
 
@@ -516,12 +621,16 @@ def cmd_vm_exec(args):
             capture_output=True, text=True, timeout=timeout,
         )
         stdout = _strip_ansi(result.stdout)
-        if result.returncode == 0 or "Permission denied" not in stdout:
+        stderr = _strip_ansi(result.stderr)
+        combined = stdout + stderr
+        auth_failures = ["Permission denied", "Please login as", "publickey,gssapi"]
+        is_auth_fail = any(p in combined for p in auth_failures)
+        if result.returncode == 0 or not is_auth_fail:
             _output({
                 "success": result.returncode == 0,
                 "return_code": result.returncode,
                 "stdout": stdout,
-                "stderr": _strip_ansi(result.stderr),
+                "stderr": stderr,
                 "method": "virtctl-ssh",
                 "duration": round(time.time() - start_time, 2),
             })
@@ -545,15 +654,31 @@ def cmd_vm_exec(args):
     output_buffer = []
     try:
         child = pexpect.spawn(console_cmd, timeout=timeout, encoding='utf-8')
-        # Send Enter to trigger login prompt
+        # Wait for console to connect, then send Enter to trigger prompt
+        child.expect(r'Successfully connected|escape sequence', timeout=30)
+        import time as _time
+        _time.sleep(2)
         child.sendline("")
-        idx = child.expect([r'ogin:\s*$', r'[\]#\$]\s*$'], timeout=15)
+        _time.sleep(1)
+        child.sendline("")
+
+        # Match login prompt or shell prompt (ANSI-tolerant)
+        idx = child.expect([r'ogin:', r'[\]#\$] *$', pexpect.TIMEOUT], timeout=15)
         if idx == 0:
             # Need to login
             child.sendline(user)
-            child.expect(r'assword:\s*$', timeout=10)
+            child.expect(r'assword:', timeout=10)
             child.sendline(password)
-            child.expect(r'[\]#\$]\s*', timeout=15)
+            child.expect(r'[\]#\$]', timeout=15)
+        elif idx == 2:
+            # Timeout — try one more Enter
+            child.sendline("")
+            child.expect([r'ogin:', r'[\]#\$]'], timeout=10)
+            if 'ogin:' in (child.after or ''):
+                child.sendline(user)
+                child.expect(r'assword:', timeout=10)
+                child.sendline(password)
+                child.expect(r'[\]#\$]', timeout=15)
 
         # At shell prompt — run the command with exit code marker
         marker = "__EQA_EXIT__"
@@ -979,6 +1104,13 @@ def main():
     p_vm_exec.add_argument("--password", default="redhat")
     p_vm_exec.add_argument("--timeout", type=int, default=60)
     p_vm_exec.set_defaults(func=cmd_vm_exec)
+
+    # vm-disks
+    p_vm_disks = subparsers.add_parser("vm-disks")
+    p_vm_disks.add_argument("vm_name")
+    p_vm_disks.add_argument("--namespace", "-n", required=True)
+    p_vm_disks.add_argument("--timeout", type=int, default=30)
+    p_vm_disks.set_defaults(func=cmd_vm_disks)
 
     # interactive
     p_interactive = subparsers.add_parser("interactive")

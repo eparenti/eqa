@@ -48,8 +48,15 @@ def _save_state(state):
         json.dump(state, f)
 
 
+STORAGE_STATE_FILE = "/tmp/eqa-web-storage.json"
+
+
 def _get_browser():
-    """Get or start Playwright browser and page."""
+    """Get or start Playwright browser and page.
+
+    Persists cookies and storage state between calls so that login sessions
+    survive across separate fill/click/navigate invocations.
+    """
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
@@ -58,13 +65,21 @@ def _get_browser():
 
     state = _load_state()
 
-    # Playwright can't persist across processes, so we start fresh each call
-    # but we track the URL to restore navigation state
     pw = sync_playwright().start()
     browser = pw.chromium.launch(headless=True)
+
+    # Restore cookies/session from previous calls
+    storage_state = None
+    if os.path.exists(STORAGE_STATE_FILE):
+        try:
+            storage_state = STORAGE_STATE_FILE
+        except Exception:
+            pass
+
     context = browser.new_context(
         ignore_https_errors=True,
         viewport={"width": 1280, "height": 720},
+        storage_state=storage_state,
     )
     page = context.new_page()
 
@@ -74,18 +89,23 @@ def _get_browser():
         try:
             page.goto(last_url, wait_until="domcontentloaded", timeout=15000)
         except Exception:
-            pass  # Page may not be available anymore
+            pass
 
     return pw, browser, page
 
 
 def _cleanup(pw, browser, page, save_url=True):
-    """Save state and close browser."""
+    """Save state, cookies, and close browser."""
     if save_url:
         try:
             state = _load_state()
             state["last_url"] = page.url
             _save_state(state)
+        except Exception:
+            pass
+        # Persist cookies and storage state for next invocation
+        try:
+            page.context.storage_state(path=STORAGE_STATE_FILE)
         except Exception:
             pass
     try:
@@ -260,10 +280,68 @@ def cmd_api_post(args):
         _output({"success": False, "error": str(e)})
 
 
+def cmd_login(args):
+    """Login to a web application (navigate + fill + submit in one session).
+
+    Handles the full login flow in a single browser session to avoid
+    losing form state between separate fill/click calls. Use --then
+    to navigate to a specific page after login (e.g., the VMs page).
+    """
+    pw, browser, page = _get_browser()
+    try:
+        import time as _time
+
+        page.goto(args.url, timeout=30000)
+        # Wait for login form (page may redirect through OAuth first)
+        page.wait_for_selector(args.username_selector, timeout=30000)
+        _time.sleep(1)
+
+        page.fill(args.username_selector, args.username, timeout=10000)
+        page.fill(args.password_selector, args.password, timeout=10000)
+
+        page.click(args.submit_selector, timeout=10000)
+        _time.sleep(10)  # Wait for OAuth redirect chain to complete
+
+        # Navigate to target page after login
+        if args.then:
+            page.goto(args.then, wait_until="domcontentloaded", timeout=30000)
+            # Wait for SPA content to render
+            _time.sleep(5)
+            # Try to wait for page content (non-fatal)
+            try:
+                page.wait_for_selector("nav, [data-test], .pf-v6-c-page, .co-m-pane__body", timeout=15000)
+            except Exception:
+                pass  # SPA may not have these selectors
+
+        result = {
+            "success": True,
+            "url": page.url,
+            "title": page.title(),
+        }
+
+        # Get page text if we navigated to a target
+        if args.then:
+            try:
+                result["text"] = page.inner_text("body")[:5000]
+            except Exception:
+                result["text"] = ""
+
+        if args.screenshot:
+            page.screenshot(path=args.screenshot)
+            result["screenshot"] = args.screenshot
+
+        _output(result)
+    except Exception as e:
+        _output({"success": False, "error": str(e), "url": getattr(page, 'url', '')})
+    finally:
+        _cleanup(pw, browser, page)
+
+
 def cmd_close(args):
-    """Clear web state."""
-    if os.path.exists(STATE_FILE):
-        os.unlink(STATE_FILE)
+    """Clear web state and session cookies."""
+    for f in [STATE_FILE, STORAGE_STATE_FILE]:
+        if os.path.exists(f):
+            os.unlink(f)
     _output({"success": True})
 
 
@@ -275,6 +353,17 @@ def main():
     p.add_argument("url")
     p.add_argument("--screenshot", default=None)
     p.set_defaults(func=cmd_navigate)
+
+    p = subparsers.add_parser("login")
+    p.add_argument("url", help="Login page URL")
+    p.add_argument("--username-selector", default="#inputUsername")
+    p.add_argument("--password-selector", default="#inputPassword")
+    p.add_argument("--submit-selector", default="button[type='submit']")
+    p.add_argument("--username", required=True)
+    p.add_argument("--password", required=True)
+    p.add_argument("--then", default=None, help="URL to navigate to after login")
+    p.add_argument("--screenshot", default=None)
+    p.set_defaults(func=cmd_login)
 
     p = subparsers.add_parser("click")
     p.add_argument("selector")
