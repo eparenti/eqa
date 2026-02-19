@@ -32,11 +32,25 @@ STATE_FILE = "/tmp/eqa-ssh-state.json"
 
 
 def _strip_ansi(text: str) -> str:
-    """Strip ANSI escape codes and spinner characters from output."""
+    """Strip ANSI escape codes, spinner lines, and control characters from output."""
     text = re.sub(r'\x1b\[[0-9;]*[A-Za-z]', '', text)
     text = re.sub(r'\x1b\][^\x07]*\x07', '', text)
     text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', text)
-    return text
+    # Strip DynoLabs spinner lines (e.g., "   -    Checking lab systems")
+    # These are progress indicator lines with spinner chars (- \ | /) followed by the step name.
+    # Keep only the final SUCCESS/FAIL/PASS line for each step.
+    lines = text.split('\n')
+    filtered = []
+    for line in lines:
+        stripped = line.strip()
+        # Skip spinner lines: just whitespace + single spinner char + whitespace + text
+        if re.match(r'^[-\\|/]\s{4}', stripped):
+            continue
+        # Skip empty lines that result from spinner removal
+        if not stripped:
+            continue
+        filtered.append(line)
+    return '\n'.join(filtered)
 
 
 def _load_state() -> dict:

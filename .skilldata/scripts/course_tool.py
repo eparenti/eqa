@@ -106,18 +106,30 @@ def _resolve_chapter(input_str: str, chapter_num: int) -> dict:
             "multi_repo": True,
         }
     else:
-        # Single-repo: use course EPUB
+        # Local chapter — use the course EPUB
         epub = _find_epub_in_dir(course_dir)
         if not epub:
             epub = _try_build_epub(course_dir)
         if not epub:
             return {"success": False, "error": f"No EPUB found in {course_dir}"}
 
+        # Use course code from metadata.yml if available, otherwise directory name
+        course_code = course_dir.name.lower()
+        metadata_path = course_dir / "metadata.yml"
+        if metadata_path.exists():
+            try:
+                with open(metadata_path) as f:
+                    meta = yaml.safe_load(f)
+                    if meta and 'code' in meta:
+                        course_code = meta['code'].lower()
+            except Exception:
+                pass
+
         return {
             "success": True,
             "epub_path": str(epub),
             "lesson_path": str(course_dir),
-            "lesson_code": input_str.lower(),
+            "lesson_code": course_code,
             "chapter_number": chapter_num,
             "keyword": keyword,
             "multi_repo": False,
@@ -211,16 +223,40 @@ def _find_course_dir(input_str: str) -> Path:
 
 
 def _find_lesson_dir(course_dir: Path, lesson_code: str) -> Path:
-    """Find lesson directory for a given lesson code."""
+    """Find lesson directory for a given lesson code.
+
+    Searches multiple common checkout patterns:
+    - <course>-lessons/<lesson> (standard multi-repo layout)
+    - <parent>/<lesson> (sibling directory)
+    - ~/git-repos/active/<lesson>
+    - ~/git-repos/archive/*/<lesson> (archived courses)
+    """
     parent = course_dir.parent
 
+    # Pattern: *-lessons/<lesson>
     for d in parent.glob(f"*-lessons/{lesson_code}"):
         if d.is_dir():
             return d
 
+    # Direct sibling
     sibling = parent / lesson_code
     if sibling.is_dir():
         return sibling
+
+    # Search in ~/git-repos/active/
+    active = Path.home() / "git-repos" / "active" / lesson_code
+    if active.is_dir():
+        return active
+
+    # Search in ~/git-repos/archive/*/
+    for d in (Path.home() / "git-repos" / "archive").glob(f"*/{lesson_code}"):
+        if d.is_dir():
+            return d
+
+    # Search in same archive directory as the course
+    for d in parent.glob(lesson_code):
+        if d.is_dir():
+            return d
 
     return None
 
