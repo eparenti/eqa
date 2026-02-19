@@ -76,6 +76,22 @@ INTENTIONAL_ERROR_PATTERNS = [
     r'correct\s+the\s+(?:error|mistake|problem)',
 ]
 
+VM_SSH_KEY_PATTERNS = [
+    r'ssh_authorized_keys',
+    r'ssh-rsa\s+AAAA',
+    r'authorized_keys',
+    r'identity.*file',
+    r'virtctl\s+ssh\b',
+]
+
+VM_PASSWORD_PATTERNS = [
+    r'log\s*in\s+as\s+(?:the\s+)?root\s+user\s+with\s+\w+\s+as\s+the\s+password',
+    r'password.*redhat',
+    r'chpasswd',
+    r'passwd\s+--stdin',
+    r'console\s+tab.*log\s*in',
+]
+
 STANDARD_HOSTS = {
     'servera', 'serverb', 'serverc', 'serverd', 'servere',
     'workstation', 'bastion', 'utility',
@@ -211,6 +227,13 @@ def cmd_build(args):
     profile["uses_sol_files"] = bool(re.search(r'\.sol\b', text_lower))
     profile["uses_solve_playbooks"] = bool(re.search(r'lab\s+solve|solve\s+playbook', text_lower))
     profile["uses_lab_grade"] = bool(re.search(r'lab\s+grade', text_lower))
+
+    # VM authentication
+    ssh_key_count = sum(1 for p in VM_SSH_KEY_PATTERNS if re.search(p, text_lower))
+    password_count = sum(1 for p in VM_PASSWORD_PATTERNS if re.search(p, text_lower))
+    profile["vm_auth"] = "ssh_keys" if ssh_key_count >= 2 else ("password" if password_count >= 2 else "unknown")
+    pw_match = re.search(r'log\s*in\s+as\s+(?:the\s+)?root\s+user\s+with\s+(\w+)\s+as\s+the\s+password', text_lower)
+    profile["vm_default_password"] = pw_match.group(1) if pw_match else None
 
     # Real hosts
     real_hosts = []

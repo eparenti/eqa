@@ -1,6 +1,6 @@
 ---
 name: eqa
-version: 5.1.0
+version: 5.3.0
 description: Automated exercise QA for Red Hat Training courses
 authors:
   - Ed Parenti <eparenti@redhat.com>
@@ -75,13 +75,80 @@ python3 ~/git-repos/eqa/.skilldata/scripts/profile_tool.py build <extract_dir>
 
 Analyzes EPUB content to detect: technology stack, dev containers, tool locations, teaching patterns, ansible collections, real hosts, network devices.
 
-### 5. For Multi-Repo Courses: Install Lesson
+### 5. Ensure Correct Lab Package
 
+The grading package on the workstation **must match** the EPUB being tested. A version mismatch means grading checks, VM names, and exercise logic may differ from the EPUB instructions — causing false test failures.
+
+#### How lab packages work
+
+The DynoLabs 5 Rust CLI (`/usr/local/bin/lab`) manages Python grading packages via `uv`. Key concepts:
+
+- **Lab manifest** (`~/.grading/lab_manifest.json`): Maps exercise names to course SKUs and versions
+- **Course packages** (e.g., `rht-labs-do316`, `rht-labs-au0022l`): Python packages containing grading scripts, Ansible playbooks, and lab materials
+- **Active course**: Only one course is "active" at a time (`lab version` shows it)
+- **PyPI mirror**: Packages are fetched from `pypi.apps.tools-na.prod.nextcle.com`
+
+#### Package installation commands
+
+| Command | Behavior | Use When |
+|---------|----------|----------|
+| `lab install <sku>` | Respects manifest constraints, blocks non-manifest packages | Normal student/instructor use |
+| `lab force <sku>` | **Bypasses all constraints**, always updates manifest | Dev/testing, installing packages not in manifest |
+| `lab force <sku>=<version>` | Force-installs exact version | Testing specific version |
+| `lab activate <sku>` | Switches active course (no install) | Switching between already-installed courses |
+| `lab list` | Shows installed courses and active status | Checking what's available |
+| `lab version` | Shows active course library and version | Verifying active package |
+
+#### Step 5 workflow
+
+**a) Check what's installed:**
 ```bash
-python3 ~/git-repos/eqa/.skilldata/scripts/ssh_tool.py lab install <lesson_code>
+ssh_tool.py run "lab version"
+ssh_tool.py run "lab list"
 ```
 
-Required before exercises can be tested in multi-repo courses. Must be run each time you switch to a different lesson — installing a new lesson replaces the previous one.
+**b) Determine the correct package SKU.** The `course_tool.py resolve` output includes the `lesson_code`. For multi-repo courses, each chapter has its own SKU (e.g., `au0022l`). For single-repo courses, the SKU is the course code (e.g., `do316`).
+
+**c) Install or force-install the package:**
+
+```bash
+# If the package is in the manifest:
+ssh_tool.py lab install <lesson_code>
+
+# If blocked ("not part of this course curriculum"), use force:
+ssh_tool.py run "lab force <lesson_code>"
+```
+
+`lab force` bypasses the manifest version lock and course validation. It is designed for developers and testers. It always updates the manifest to reflect the forced installation.
+
+**d) Verify the active package matches:**
+```bash
+ssh_tool.py run "lab version"
+```
+
+**e) For multi-repo courses**, `lab install` or `lab force` must be run each time you switch to a different lesson — installing a new lesson replaces the previous one.
+
+#### Namespace syntax for cross-course exercises
+
+When multiple installed courses have exercises with the same name, use namespace syntax:
+```bash
+lab start <sku>::<exercise>
+# e.g.: lab start do316::storage-review
+```
+
+#### Detecting version mismatches
+
+After `lab start`, immediately run `lab grade` to compare grading checks against the EPUB:
+
+```bash
+# After lab start succeeds, run grade to see what the installed package checks
+ssh_tool.py lab grade <exercise>
+```
+
+- Compare the grading check descriptions (VM names, project names, resource names) against the EPUB steps
+- If they don't match, the installed package is a different version than the EPUB
+- Use `lab version` to see the installed package version vs the EPUB's `pyproject.toml` version
+- Use `lab force <sku>` to install the correct version matching the EPUB
 
 ## Test Categories
 
@@ -474,7 +541,8 @@ Write reports to `~/git-repos/eqa/results/`. Use filename pattern: `<exercise-id
 | `connect` | Start ControlMaster | `--host workstation` |
 | `status` | Check connection, framework, disk space | |
 | `run <cmd>` | Execute command (auto-reconnects) | `--timeout 120` |
-| `lab <action> <exercise>` | Framework-aware lab command | `--timeout 300` |
+| `lab <action> <exercise>` | Framework-aware lab command (start/finish/grade/install/solve/force) | `--timeout 600` |
+| `vm-exec <vm>` | Run command inside a KubeVirt VM (tries SSH, falls back to console) | `-n <ns>`, `-c <cmd>`, `--user`, `--password` |
 | `interactive <cmd>` | Interactive command via pexpect | `--prompts '[[pat,resp],...]'` |
 | `write-file <path>` | Write file (base64) | `--content <b64>` |
 | `read-file <path>` | Read remote file | |
@@ -561,10 +629,14 @@ These courses use `oc` and `kubectl` commands, virtual machines via OpenShift Vi
 4. If `lab install` fails with "not part of this course curriculum", the workstation image doesn't include that course. Check `lab list` for available SKUs
 
 **DynoLabs package installation:**
+- The `lab` binary is a compiled Rust CLI (`/usr/local/bin/lab`) that manages Python grading packages via `uv`
 - Each lesson has a Python grading package in `classroom/grading/` with a `pyproject.toml`
-- `lab install <sku>` uses `uv` to install the package from the Red Hat Training PyPI mirror
-- The package depends on `rht-labs-core` (the DynoLabs framework) and course-specific libraries (e.g., `rht-labs-ocpvirt` for OpenShift Virtualization)
-- The lab manifest maps exercise names to their lesson SKU and version
+- `lab install <sku>` uses `uv` to install the package from the Red Hat Training PyPI mirror — but is blocked for packages not in the manifest
+- `lab force <sku>` bypasses all manifest constraints and is the correct tool for QA/development when testing packages not in the workstation's manifest
+- The package depends on `rht-labs-core` (the DynoLabs framework) and course-specific libraries (e.g., `rht-labs-ocp` for OpenShift)
+- The lab manifest (`~/.grading/lab_manifest.json`) maps exercise names to their lesson SKU and version
+- `lab version` shows the active course library name and version
+- `lab activate <sku>` switches between already-installed courses without reinstalling
 
 **Storage classes:**
 - Before creating PVCs, always check available storage classes: `oc get sc`
@@ -573,7 +645,9 @@ These courses use `oc` and `kubectl` commands, virtual machines via OpenShift Vi
 - Common pattern: `ocs-external-storagecluster-ceph-rbd-virtualization` for VM disks
 
 **Virtual machine operations:**
-- `virtctl console <vm>` is interactive — use `virtctl ssh <user>@<vm> --command '<cmd>' -l <user> --known-hosts=` for non-interactive execution
+- Use `ssh_tool.py vm-exec <vm> -n <ns> -c <cmd>` to run commands inside VMs. It auto-detects the auth method (SSH keys vs password) and falls back to serial console when needed.
+- Check the course profile's `vm_auth` field: `"ssh_keys"` means `virtctl ssh` works directly, `"password"` means the VMs use password auth via the VNC/serial console. The `vm_default_password` field contains the password if detected.
+- `virtctl console <vm>` is interactive — use `ssh_tool.py vm-exec` or `virtctl ssh <user>@<vm> --command '<cmd>' -l <user> --known-hosts=` for non-interactive execution
 - VM disk attachment requires stop → modify → start cycle (the web console does this automatically)
 - To add a disk programmatically: create PVC with correct storage class, then `virtctl addvolume <vm> --volume-name=<pvc> --persist`, then restart the VM
 - Wait for VMs to be in `Running` status before connecting: `oc get vm -n <project>`
@@ -643,14 +717,77 @@ Do NOT translate `ansible-navigator` to `ansible-playbook`. The course profile t
 - **Exercise has GUI steps**: Translate to programmatic equivalents (see GUI translation table above)
 - **ansible-navigator hangs**: Missing `-m stdout` flag. Always append it for non-interactive execution
 - **AAP Controller web UI steps**: Use `rht-labs-aapcli` or Controller REST API via `web_tool.py api-get/api-post`
-- **Switching lessons in multi-repo course**: Must run `lab install <new-lesson>` before testing exercises in a different lesson
-- **`lab install` fails "not part of this course curriculum"**: The workstation image doesn't include this course's manifest. Check `cat /etc/rht` for `RHT_COURSE` and `lab list` for available SKUs. The workstation may be provisioned for a different course
+- **Switching lessons in multi-repo course**: Must run `lab install <new-lesson>` (or `lab force <new-lesson>`) before testing exercises in a different lesson
+- **`lab install` fails "not part of this course curriculum"**: Use `lab force <sku>` to bypass manifest constraints. This is normal when the workstation is provisioned for a different course (e.g., workstation has DO981 but you're testing DO316 exercises). `lab force` always works and updates the manifest.
+- **Version mismatch between EPUB and installed package**: The installed grading package may have different VM names, exercise logic, or grading checks than the EPUB. Use `lab force <sku>` to install the correct version matching the EPUB. Check `lab version` vs the git repo's `pyproject.toml`
 - **OCP exercise needs storage**: Always run `oc get sc` first to find the right storage class. Don't hardcode storage class names
-- **`virtctl console` hangs**: Use `virtctl ssh --command` instead for non-interactive VM access
+- **Running commands inside VMs**: Use `ssh_tool.py vm-exec <vm> -n <ns> -c <cmd>`. It tries `virtctl ssh` first (key auth), then falls back to serial console with login automation. Check `vm_auth` and `vm_default_password` in the course profile for auth method.
+- **`virtctl console` hangs**: Use `ssh_tool.py vm-exec` instead, or `virtctl ssh --command` for non-interactive VM access
 - **VM disk not visible after attach**: The VM needs a restart. Stop → add volume → start
 - **OCP web console steps**: Prefer `oc` CLI equivalents for reliability. Use `web_tool.py` Playwright for visual verification and web-console-only workflows
 - **Network device exercises**: Apply 2x timeout multiplier for all SSH/device commands
 - **Troubleshooting exercise**: Check `exercises_with_deliberate_bugs` in profile — failures may be intentional
+
+## Lab CLI Reference (DynoLabs 5)
+
+The `lab` command is a Rust binary at `/usr/local/bin/lab`. It wraps Python grading packages managed via `uv`.
+
+### Package Management
+
+| Command | Description |
+|---------|-------------|
+| `lab install <sku>` | Install course package (respects manifest constraints) |
+| `lab force <sku>` | Install package bypassing all constraints (for dev/QA) |
+| `lab force <sku>=<version>` | Force-install exact version |
+| `lab activate <sku>` | Switch active course without reinstalling |
+| `lab list` | List installed courses |
+| `lab version` | Show active course library and version |
+| `lab release` | Show lab CLI version |
+| `lab clean` | Remove course history and grading config |
+| `lab clean --labs` | Remove UV cache + course history + grading config |
+| `lab clean --all` | Remove everything except manifest |
+
+### Lab Operations
+
+| Command | Description |
+|---------|-------------|
+| `lab start <exercise>` | Start exercise (creates resources, copies files) |
+| `lab finish <exercise>` | Clean up exercise (removes resources) |
+| `lab grade <exercise>` | Grade exercise (Labs only) |
+| `lab solve <exercise>` | Auto-solve exercise (if supported) |
+| `lab status` | Show active lab state |
+| `lab status <exercise> --reset` | Reset stuck lab state |
+| `lab start <sku>::<exercise>` | Run exercise from specific course (namespace syntax) |
+
+### Testing (Hidden Features)
+
+| Command | Description |
+|---------|-------------|
+| `lab autotest` | Run all lab scripts in random order |
+| `lab autotest --ignore-errors` | Continue testing after failures |
+| `lab coursetest <scripts.yml>` | Sequential course workflow testing |
+
+### Key Files
+
+| Path | Description |
+|------|-------------|
+| `~/.grading/lab_manifest.json` | Maps exercise names to course SKUs and versions |
+| `~/.grading/lab_state.json` | Tracks active lab state |
+| `~/.grading/config.yaml` | Grading configuration |
+| `/etc/rht` | Workstation course info (`RHT_COURSE`, `RHT_VMTREE`, `VERSION_LOCK`) |
+
+### Environment Variables
+
+| Variable | Description |
+|----------|-------------|
+| `PYPI_URL` | Custom PyPI URL (highest priority) |
+| `PKG_ENV` | Environment: `prod`, `stage`, `factory` |
+| `UV_PYTHON_VERSION` | Override Python version for uv |
+
+### References
+
+- [Lab CLI (Rust)](https://github.com/RedHatTraining/classroom-api) — DynoLabs 5 Rust CLI source, manifest management, autotest
+- [rht-labs-core](https://github.com/RedHatTraining/rht-labs-core) — DynoLabs grading framework (Python), lab script development guides
 
 ## Cleanup
 

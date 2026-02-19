@@ -344,10 +344,13 @@ def cmd_lab(args):
     prefix = state.get("framework_prefix", "lab")
     framework = state.get("framework", "unknown")
 
-    # Strip -ge/-lab suffix
-    lab_name = exercise.removesuffix('-ge').removesuffix('-lab')
-
-    cmd = f"{prefix} {action} {lab_name}"
+    # 'force' bypasses framework prefix, uses raw exercise as SKU
+    if action == 'force':
+        cmd = f"lab force {exercise}"
+    else:
+        # Strip -ge/-lab suffix
+        lab_name = exercise.removesuffix('-ge').removesuffix('-lab')
+        cmd = f"{prefix} {action} {lab_name}"
     _err(f"Running: {cmd} (framework: {framework})")
 
     start_time = time.time()
@@ -478,6 +481,127 @@ def cmd_interactive(args):
             "return_code": -1,
             "stdout": "".join(output_buffer),
             "stderr": f"Interactive execution error: {e}",
+            "duration": round(time.time() - start_time, 2),
+        })
+
+
+def cmd_vm_exec(args):
+    """Execute a command inside a KubeVirt VM.
+
+    Tries virtctl ssh first (fast, clean output). If that fails due to
+    auth issues, falls back to serial console via pexpect.
+    """
+    state = _load_state()
+    if not state:
+        _output({"success": False, "error": "Not connected. Run 'connect' first."})
+        return
+
+    vm_name = args.vm_name
+    namespace = args.namespace
+    command = args.command
+    user = args.user
+    password = args.password
+    timeout = args.timeout
+
+    start_time = time.time()
+
+    # Strategy 1: virtctl ssh (key-based auth)
+    ssh_cmd = (
+        f"virtctl ssh {user}@{vm_name} -n {namespace} "
+        f"--command {_shell_quote(command)} -l {user} --known-hosts="
+    )
+    try:
+        result = subprocess.run(
+            ['ssh'] + _ssh_opts(state) + [state["host"], ssh_cmd],
+            capture_output=True, text=True, timeout=timeout,
+        )
+        stdout = _strip_ansi(result.stdout)
+        if result.returncode == 0 or "Permission denied" not in stdout:
+            _output({
+                "success": result.returncode == 0,
+                "return_code": result.returncode,
+                "stdout": stdout,
+                "stderr": _strip_ansi(result.stderr),
+                "method": "virtctl-ssh",
+                "duration": round(time.time() - start_time, 2),
+            })
+            return
+    except subprocess.TimeoutExpired:
+        pass  # fall through to console
+
+    _err(f"virtctl ssh failed for {vm_name}, falling back to serial console")
+
+    # Strategy 2: Serial console via pexpect
+    try:
+        import pexpect
+    except ImportError:
+        _output({"success": False, "error": "pexpect not installed and virtctl ssh failed"})
+        return
+
+    console_cmd = (
+        f"ssh -o ControlPath={state['control_path']} -o ConnectTimeout=10 "
+        f"{state['host']} virtctl console {vm_name} -n {namespace}"
+    )
+    output_buffer = []
+    try:
+        child = pexpect.spawn(console_cmd, timeout=timeout, encoding='utf-8')
+        # Send Enter to trigger login prompt
+        child.sendline("")
+        idx = child.expect([r'ogin:\s*$', r'[\]#\$]\s*$'], timeout=15)
+        if idx == 0:
+            # Need to login
+            child.sendline(user)
+            child.expect(r'assword:\s*$', timeout=10)
+            child.sendline(password)
+            child.expect(r'[\]#\$]\s*', timeout=15)
+
+        # At shell prompt — run the command with exit code marker
+        marker = "__EQA_EXIT__"
+        child.sendline(f"{command}; echo {marker}=$?")
+        child.expect(f'{marker}=(\\d+)', timeout=timeout)
+        output_buffer.append(child.before or "")
+        exit_code = int(child.match.group(1))
+
+        # Logout
+        child.sendline("exit")
+        try:
+            child.expect(pexpect.EOF, timeout=5)
+        except (pexpect.TIMEOUT, pexpect.EOF):
+            pass
+        child.close()
+
+        raw_output = "".join(output_buffer)
+        # Strip ANSI codes and the echoed command line
+        clean_output = _strip_ansi(raw_output)
+        # Remove the echoed command from the output
+        lines = clean_output.split('\n')
+        filtered = [l for l in lines if command not in l and marker not in l]
+        clean_output = '\n'.join(filtered).strip()
+
+        _output({
+            "success": exit_code == 0,
+            "return_code": exit_code,
+            "stdout": clean_output,
+            "stderr": "",
+            "method": "console",
+            "duration": round(time.time() - start_time, 2),
+        })
+    except pexpect.TIMEOUT:
+        _output({
+            "success": False,
+            "return_code": -1,
+            "stdout": "".join(output_buffer),
+            "stderr": f"VM console timed out after {timeout}s",
+            "method": "console",
+            "duration": round(time.time() - start_time, 2),
+        })
+    except Exception as e:
+        _output({
+            "success": False,
+            "return_code": -1,
+            "stdout": "".join(output_buffer),
+            "stderr": f"VM exec error: {e}",
+            "method": "console",
             "duration": round(time.time() - start_time, 2),
         })
 
@@ -841,10 +965,20 @@ def main():
 
     # lab
     p_lab = subparsers.add_parser("lab")
-    p_lab.add_argument("action", choices=["start", "finish", "grade", "install"])
+    p_lab.add_argument("action", choices=["start", "finish", "grade", "install", "solve", "force"])
     p_lab.add_argument("exercise")
-    p_lab.add_argument("--timeout", type=int, default=300)
+    p_lab.add_argument("--timeout", type=int, default=600)
     p_lab.set_defaults(func=cmd_lab)
+
+    # vm-exec
+    p_vm_exec = subparsers.add_parser("vm-exec")
+    p_vm_exec.add_argument("vm_name")
+    p_vm_exec.add_argument("--namespace", "-n", required=True)
+    p_vm_exec.add_argument("--command", "-c", required=True)
+    p_vm_exec.add_argument("--user", default="root")
+    p_vm_exec.add_argument("--password", default="redhat")
+    p_vm_exec.add_argument("--timeout", type=int, default=60)
+    p_vm_exec.set_defaults(func=cmd_vm_exec)
 
     # interactive
     p_interactive = subparsers.add_parser("interactive")
