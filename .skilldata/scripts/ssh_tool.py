@@ -31,21 +31,32 @@ import time
 STATE_FILE = "/tmp/eqa-ssh-state.json"
 
 
-def _strip_ansi(text: str) -> str:
-    """Strip ANSI escape codes, spinner lines, and control characters from output."""
+def _strip_ansi(text: str, strip_spinners: bool = True) -> str:
+    """Strip ANSI escape codes and control characters from output.
+
+    Args:
+        text: Raw text with potential ANSI codes.
+        strip_spinners: If True, also remove DynoLabs spinner progress lines
+            and collapse empty lines. Set to False for VM command output
+            where all content should be preserved.
+    """
     text = re.sub(r'\x1b\[[0-9;?]*[A-Za-z]', '', text)  # CSI sequences (including ?2004h/l)
     text = re.sub(r'\x1b\][^\x07]*\x07', '', text)       # OSC sequences
     text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', text)  # control chars
     text = text.replace('\r\n', '\n').replace('\r', '\n')  # normalize line endings
+
+    if not strip_spinners:
+        return text
+
     # Strip DynoLabs spinner lines (e.g., "   -    Checking lab systems")
-    # These are progress indicator lines with spinner chars (- \ | /) followed by the step name.
-    # Keep only the final SUCCESS/FAIL/PASS line for each step.
+    # These are progress indicator lines with a single spinner char (- \ /)
+    # followed by 4+ spaces. Exclude | to avoid matching MySQL table output.
     lines = text.split('\n')
     filtered = []
     for line in lines:
         stripped = line.strip()
-        # Skip spinner lines: just whitespace + single spinner char + whitespace + text
-        if re.match(r'^[-\\|/]\s{4}', stripped):
+        # Skip spinner lines: single spinner char (not |) + 4 spaces + text
+        if re.match(r'^[-\\/]\s{4}', stripped):
             continue
         # Skip empty lines that result from spinner removal
         if not stripped:
@@ -269,6 +280,41 @@ def cmd_status(args):
             pass
 
     _output(result)
+
+
+def cmd_tunnel(args):
+    """Generate sshuttle command for classroom network tunnel."""
+    state = _load_state()
+    if not state:
+        _output({"success": False, "error": "Not connected. Run 'connect' first."})
+        return
+
+    if not _check_connection(state):
+        _output({"success": False, "error": "Connection lost. Run 'connect' again."})
+        return
+
+    try:
+        nets = subprocess.run(
+            ['ssh'] + _ssh_opts(state) + [state["host"],
+             "ip route | grep -v default | awk '{print $1}' | grep -v '^10\\.88\\.'"],
+            capture_output=True, text=True, timeout=5,
+        )
+        subnets = [s.strip() for s in nets.stdout.strip().split('\n') if s.strip()]
+    except Exception:
+        subnets = []
+
+    if not subnets:
+        _output({"success": False, "error": "Could not detect classroom subnets"})
+        return
+
+    host = state["host"]
+    cmd = f"sudo sshuttle --dns -r {host} {' '.join(subnets)} -D"
+    _output({
+        "success": True,
+        "subnets": subnets,
+        "command": cmd,
+        "instructions": f"Run this in a separate terminal: {cmd}",
+    })
 
 
 def cmd_run(args):
@@ -696,8 +742,8 @@ def cmd_vm_exec(args):
         child.close()
 
         raw_output = "".join(output_buffer)
-        # Strip ANSI codes and the echoed command line
-        clean_output = _strip_ansi(raw_output)
+        # Strip ANSI codes but preserve all content lines (no spinner filtering)
+        clean_output = _strip_ansi(raw_output, strip_spinners=False)
         # Remove the echoed command from the output
         lines = clean_output.split('\n')
         filtered = [l for l in lines if command not in l and marker not in l]
@@ -1081,6 +1127,10 @@ def main():
     # status
     p_status = subparsers.add_parser("status")
     p_status.set_defaults(func=cmd_status)
+
+    # tunnel
+    p_tunnel = subparsers.add_parser("tunnel")
+    p_tunnel.set_defaults(func=cmd_tunnel)
 
     # run
     p_run = subparsers.add_parser("run")

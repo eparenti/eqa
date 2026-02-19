@@ -1,6 +1,6 @@
 ---
 name: eqa
-version: 5.3.0
+version: 5.4.0
 description: Automated exercise QA for Red Hat Training courses
 authors:
   - Ed Parenti <eparenti@redhat.com>
@@ -494,7 +494,9 @@ When a command or test fails, analyze the error and provide:
 
 ## Report Format
 
-Write reports to `~/git-repos/eqa/results/`. Use filename pattern: `<exercise-id>-<YYYYMMDD-HHMMSS>.md`
+Write individual exercise reports to `~/git-repos/eqa/results/`. Use filename pattern: `<exercise-id>-<YYYYMMDD-HHMMSS>.md`
+
+When testing multiple exercises (chapter or course), also generate a **summary report** after all exercises are tested. Use filename pattern: `<course>-ch<N>-summary-<YYYYMMDD>.md`
 
 ### Report Structure
 
@@ -579,73 +581,56 @@ Write reports to `~/git-repos/eqa/results/`. Use filename pattern: `<exercise-id
 <Key characteristics from profile_tool>
 ```
 
+### Chapter Summary Report (for multi-exercise runs)
+
+When testing a chapter or multiple exercises, generate a summary report after all individual reports:
+
+```markdown
+# Chapter QA Summary: <course> Chapter <N>
+
+**Course:** <course_code> - <course_title>
+**Chapter:** <N> (<keyword>)
+**Date:** <timestamp>
+**Exercises tested:** N/M
+**Result:** PASS | CONDITIONAL | FAIL
+
+## Exercise Results
+
+| Exercise | Type | Result | Bugs | Duration |
+|----------|------|--------|------|----------|
+| exercise-1 | GE | PASS | 0 | 45s |
+| exercise-2 | GE | PASS | 1 P3 | 52s |
+| exercise-3 | Lab | FAIL | 1 P1 | 68s |
+
+## Aggregate Metrics
+
+- Total bugs: N (P0: N, P1: N, P2: N, P3: N)
+- Defect density: X.X bugs/exercise
+- Critical ratio: X%
+- Total test duration: Xs
+- Release readiness: Ready | Conditional | Not ready
+
+## All Bugs
+
+| ID | Exercise | Severity | Description | Component |
+|----|----------|----------|-------------|-----------|
+
+## Recommendations
+
+<Prioritized list of fixes needed before release>
+```
+
 ## Utility Reference
 
-### ssh_tool.py
+See `.skilldata/docs/tools-reference.md` for full tool documentation (ssh_tool.py, epub_tool.py, course_tool.py, profile_tool.py, web_tool.py).
 
-| Subcommand | Description | Key Options |
-|------------|-------------|-------------|
-| `connect` | Start ControlMaster | `--host workstation` |
-| `status` | Check connection, framework, disk space | |
-| `run <cmd>` | Execute command (auto-reconnects) | `--timeout 120` |
-| `lab <action> <exercise>` | Framework-aware lab command (start/finish/grade/install/solve/force) | `--timeout 600` |
-| `vm-exec <vm>` | Run command inside a KubeVirt VM (tries SSH, falls back to console) | `-n <ns>`, `-c <cmd>`, `--user`, `--password` |
-| `vm-disks <vm>` | List VM disk attachments via virsh (parsed JSON) | `-n <ns>` |
-| `interactive <cmd>` | Interactive command via pexpect | `--prompts '[[pat,resp],...]'` |
-| `write-file <path>` | Write file (base64) | `--content <b64>` |
-| `read-file <path>` | Read remote file | |
-| `devcontainer-start <dir>` | Parse devcontainer.json, start (checks disk) | |
-| `devcontainer-run <cmd>` | Execute in container | `--workdir`, `--user` |
-| `devcontainer-stop` | Stop container | |
-| `autotest` | DynoLabs 5 autotest (Rust CLI) | `--ignore-errors`, `--timeout 1800` |
-| `coursetest` | DynoLabs 5 coursetest (Rust CLI) | `--dry-run`, `--timeout 3600` |
-| `disconnect` | Tear down connection | |
-
-### epub_tool.py
-
-| Subcommand | Description | Key Options |
-|------------|-------------|-------------|
-| `parse <epub>` | Extract course structure | `--lesson-path <path>` |
-| `instructions <epub> <id>` | Get exercise steps | |
-| `summary <epub>` | Testability overview per exercise | `--lesson-path <path>` |
-| `build <course_path>` | Build EPUB via sk | `--force` |
-
-### course_tool.py
-
-| Subcommand | Description | Key Options |
-|------------|-------------|-------------|
-| `resolve <input>` | Resolve to epub+lesson path | `--chapter N` |
-| `detect <repo_path>` | Auto-detect course metadata | |
-
-### profile_tool.py
-
-| Subcommand | Description |
-|------------|-------------|
-| `build <extract_dir>` | Build course profile from EPUB |
-
-### web_tool.py
-
-| Subcommand | Description | Key Options |
-|------------|-------------|-------------|
-| `login <url>` | Login to web app (fill + submit in one session) | `--username`, `--password`, `--then <url>`, `--screenshot` |
-| `navigate <url>` | Open URL in headless browser | `--screenshot <path>` |
-| `click <selector>` | Click element | `--screenshot <path>` |
-| `fill <selector> <value>` | Fill form field | |
-| `text <selector>` | Get element text | |
-| `screenshot <path>` | Capture current page | |
-| `page-text` | Get full page text | |
-| `wait <selector>` | Wait for element | `--timeout 10000` |
-| `evaluate <js>` | Run JavaScript | |
-| `api-get <url>` | HTTP GET request | `--headers <json>` |
-| `api-post <url>` | HTTP POST request | `--data <json>`, `--headers <json>` |
-| `close` | Clear browser state | |
-
-Requires: `pip install playwright && playwright install chromium`
-The `api-get` and `api-post` subcommands do NOT require Playwright (use urllib directly).
-
-### AAP Controller CLI
-
-For courses that use AAP Automation Controller, use the `rht-labs-aapcli` tool at `~/git-repos/active/rht-labs-aapcli` to interact with the Controller API programmatically (create job templates, launch jobs, manage inventories, etc.).
+Key commands used most often:
+- `ssh_tool.py run <cmd>` — execute command on workstation
+- `ssh_tool.py lab <action> <exercise>` — lab start/finish/grade/force/solve
+- `ssh_tool.py vm-exec <vm> -n <ns> -c <cmd>` — run command inside a VM
+- `ssh_tool.py vm-disks <vm> -n <ns>` — list VM disk attachments as JSON
+- `ssh_tool.py tunnel` — generate sshuttle command for network tunnel
+- `web_tool.py login <url> --username <u> --password <p> --then <url>` — web console login
 
 ## Course Patterns
 
@@ -669,159 +654,15 @@ The skill auto-detects 3 course patterns from `outline.yml`:
 
 ### OpenShift / Kubernetes Courses (DO*)
 
-These courses use `oc` and `kubectl` commands, virtual machines via OpenShift Virtualization, and the OpenShift web console.
+See `.skilldata/docs/ocp-recipes.md` for full OCP reference including VM disk operations, storage classes, web console testing with Playwright, dev container exercises, and ansible-navigator usage.
 
-**Lab environment setup:**
-1. The workstation must be provisioned with an OCP cluster image (check `cat /etc/rht` for `RHT_COURSE` and `RHT_VMTREE`)
-2. The lab manifest (`~/.grading/lab_manifest.json`) lists which exercise SKUs are available
-3. Run `lab install <lesson-sku>` to install grading packages for each lesson — the SKU is the lowercase lesson code (e.g., `do0024l`)
-4. If `lab install` fails with "not part of this course curriculum", the workstation image doesn't include that course. Check `lab list` for available SKUs
-
-**DynoLabs package installation:**
-- The `lab` binary is a compiled Rust CLI (`/usr/local/bin/lab`) that manages Python grading packages via `uv`
-- Each lesson has a Python grading package in `classroom/grading/` with a `pyproject.toml`
-- `lab install <sku>` uses `uv` to install the package from the Red Hat Training PyPI mirror — but is blocked for packages not in the manifest
-- `lab force <sku>` bypasses all manifest constraints and is the correct tool for QA/development when testing packages not in the workstation's manifest
-- The package depends on `rht-labs-core` (the DynoLabs framework) and course-specific libraries (e.g., `rht-labs-ocp` for OpenShift)
-- The lab manifest (`~/.grading/lab_manifest.json`) maps exercise names to their lesson SKU and version
-- `lab version` shows the active course library name and version
-- `lab activate <sku>` switches between already-installed courses without reinstalling
-
-**Storage classes:**
-- Before creating PVCs, always check available storage classes: `oc get sc`
-- Different clusters use different storage backends (Ceph RBD, LVMS, etc.)
-- Use the default storage class or the one the exercise specifies
-- Common pattern: `ocs-external-storagecluster-ceph-rbd-virtualization` for VM disks
-
-**Virtual machine operations:**
-- Use `ssh_tool.py vm-exec <vm> -n <ns> -c <cmd>` to run commands inside VMs. It auto-detects the auth method (SSH keys vs password) and falls back to serial console when needed.
-- Check the course profile's `vm_auth` field: `"ssh_keys"` means `virtctl ssh` works directly, `"password"` means the VMs use password auth via the VNC/serial console. The `vm_default_password` field contains the password if detected.
-- `virtctl console <vm>` is interactive — use `ssh_tool.py vm-exec` or `virtctl ssh <user>@<vm> --command '<cmd>' -l <user> --known-hosts=` for non-interactive execution
-- Wait for VMs to be in `Running` status before connecting: `oc get vm -n <project>`
-- Verify disk state from outside the VM using `virsh domblklist` via the virt-launcher pod:
-  ```bash
-  oc exec -n <ns> $(oc get pods -n <ns> -l vm.kubevirt.io/name=<vm> --no-headers -o name) -- virsh domblklist 1
-  ```
-
-**Adding disks to VMs (programmatic equivalent of web console "Add disk"):**
-
-The web console's "Add disk" creates a DataVolume and patches the VM spec. To replicate this programmatically:
-
-1. **Create a DataVolume** for the disk:
-```bash
-ssh_tool.py run "cat <<'EOF' | oc apply -f -
-apiVersion: cdi.kubevirt.io/v1beta1
-kind: DataVolume
-metadata:
-  name: <disk-name>
-  namespace: <ns>
-spec:
-  source:
-    blank: {}
-  storage:
-    accessModes: [ReadWriteMany]
-    resources:
-      requests:
-        storage: <size>   # e.g. 5Gi
-    storageClassName: <sc> # e.g. ocs-external-storagecluster-ceph-rbd-virtualization
-    volumeMode: Block      # Block for RBD, Filesystem for NFS
-EOF"
-```
-
-2. **Wait for the DataVolume to be ready:**
-```bash
-ssh_tool.py run "oc wait dv/<disk-name> -n <ns> --for=condition=Ready --timeout=120s"
-```
-
-3a. **Attach with virtio interface** (VM must be stopped):
-```bash
-ssh_tool.py run "virtctl stop <vm> -n <ns>"
-# Wait for stop, then patch VM spec to add disk + volume
-ssh_tool.py run "oc patch vm <vm> -n <ns> --type=json -p '[
-  {\"op\":\"add\",\"path\":\"/spec/template/spec/domain/devices/disks/-\",\"value\":{\"name\":\"<disk-name>\",\"disk\":{\"bus\":\"virtio\"}}},
-  {\"op\":\"add\",\"path\":\"/spec/template/spec/volumes/-\",\"value\":{\"name\":\"<disk-name>\",\"dataVolume\":{\"name\":\"<disk-name>\"}}}
-]'"
-ssh_tool.py run "virtctl start <vm> -n <ns>"
-```
-Note: If the `disks` array doesn't exist in the VM spec, use `"op":"add","path":"/spec/template/spec/domain/devices/disks","value":[...]` to create it.
-
-3b. **Hot-plug with SCSI interface** (VM can stay running):
-```bash
-ssh_tool.py run "virtctl addvolume <vm> --volume-name=<disk-name> --disk-type=disk --persist -n <ns>"
-```
-Hot-plugged disks appear as `sda`/`sdb`/`sdc` (SCSI), not `vdX` (virtio).
-
-**Detaching disks from VMs:**
-
-- **Hot-plugged disks** (added via `virtctl addvolume`):
-  ```bash
-  ssh_tool.py run "virtctl removevolume <vm> --volume-name=<disk-name> --persist -n <ns>"
-  ```
-
-- **Original VM spec disks** (not hot-pluggable): Must use `oc patch` to remove from ALL three locations — `disks[]`, `volumes[]`, and `dataVolumeTemplates[]` — in a single patch. The VM must be stopped.
-  ```bash
-  # First, find the indexes:
-  ssh_tool.py run "oc get vm <vm> -n <ns> -o json | python3 -c '
-  import sys,json; vm=json.load(sys.stdin)
-  for i,d in enumerate(vm[\"spec\"][\"template\"][\"spec\"][\"domain\"][\"devices\"].get(\"disks\",[])):
-      print(f\"disk {i}: {d[\"name\"]}\")
-  for i,v in enumerate(vm[\"spec\"][\"template\"][\"spec\"][\"volumes\"]):
-      print(f\"vol  {i}: {v[\"name\"]}\")
-  for i,t in enumerate(vm[\"spec\"].get(\"dataVolumeTemplates\",[])):
-      print(f\"dvt  {i}: {t[\"metadata\"][\"name\"]}\")
-  '"
-  # Then remove by index (use the correct indexes for the disk to remove):
-  ssh_tool.py run "oc patch vm <vm> -n <ns> --type=json -p '[
-    {\"op\":\"remove\",\"path\":\"/spec/template/spec/domain/devices/disks/<disk-idx>\"},
-    {\"op\":\"remove\",\"path\":\"/spec/template/spec/volumes/<vol-idx>\"},
-    {\"op\":\"remove\",\"path\":\"/spec/dataVolumeTemplates/<dvt-idx>\"}
-  ]'"
-  ```
-  All three removals must be in the same patch — removing a volume without its dataVolumeTemplate will be rejected by the API.
-
-**Web console testing with Playwright:**
-Many OCP exercises use the web console (console-openshift-console.apps.ocp4.example.com). Use `web_tool.py` to automate:
-
-```bash
-# Login to OCP console and navigate to VMs page (single session)
-web_tool.py login "https://console-openshift-console.apps.ocp4.example.com" \
-  --username admin --password redhatocp \
-  --then "https://console-openshift-console.apps.ocp4.example.com/k8s/ns/storage-intro/kubevirt.io~v1~VirtualMachine" \
-  --screenshot "/tmp/ocp-console.png"
-```
-
-**Important:** Always use the console URL as the login target, NOT the OAuth authorize URL. The console handles the OAuth redirect chain automatically, maintaining proper state tokens.
-
-For actions that have CLI equivalents, prefer `oc` commands over Playwright — they're faster and more reliable. Use Playwright for:
-- Verifying the web console shows the correct state (visual verification)
-- Testing web console-specific workflows that have no CLI equivalent
-- Taking screenshots for QA reports
-
-### Dev Container Exercises
-
-Some courses run tools inside podman containers instead of directly on workstation.
-
-1. Course profile will show `uses_dev_containers: true`
-2. After `lab start`, check for `.devcontainer/` in exercise dir
-3. Use `devcontainer-start` to spin up the container
-4. Pre-pull the EE image inside the container before running ansible-navigator
-5. Run exercise commands via `devcontainer-run`
-6. `lab` commands still run on workstation (not in container)
-7. Let `lab finish` handle container cleanup — do NOT run `devcontainer-stop` before `lab finish`, as `lab finish` runs `remove-dev-containers.yml` which properly cleans up containers AND prunes podman storage
-
-### ansible-navigator Commands
-
-When running `ansible-navigator` via ssh_tool (non-interactively), **always append `-m stdout`** to prevent the interactive TUI from launching. The EPUB may or may not include this flag — add it regardless.
-
-```bash
-# EPUB says:          ansible-navigator run site.yml
-# You should run:     ansible-navigator run site.yml -m stdout
-
-# EPUB says:          ansible-navigator inventory -i inventory --list
-# You should run:     ansible-navigator inventory -i inventory --list -m stdout
-```
-
-Do NOT translate `ansible-navigator` to `ansible-playbook`. The course profile tells you which tool the course expects.
+Key points:
+- Use `ssh_tool.py vm-exec <vm> -n <ns> -c <cmd>` to run commands inside VMs (auto-detects SSH vs console auth)
+- Use `ssh_tool.py vm-disks <vm> -n <ns>` to verify disk attachments
+- Use `virtctl addvolume --persist` for SCSI hot-plug, DataVolume + `oc patch` for virtio
+- Use `web_tool.py login <console-url> --username admin --password redhatocp --then <target-url>` for web console
+- Always append `-m stdout` to `ansible-navigator` commands
+- For dev containers: `devcontainer-start` → `devcontainer-run` → let `lab finish` handle cleanup
 
 ## Decision Points
 
@@ -846,66 +687,13 @@ Do NOT translate `ansible-navigator` to `ansible-playbook`. The course profile t
 - **Network device exercises**: Apply 2x timeout multiplier for all SSH/device commands
 - **Troubleshooting exercise**: Check `exercises_with_deliberate_bugs` in profile — failures may be intentional
 
-## Lab CLI Reference (DynoLabs 5)
+## Lab CLI Reference
 
-The `lab` command is a Rust binary at `/usr/local/bin/lab`. It wraps Python grading packages managed via `uv`.
+See `.skilldata/docs/lab-cli.md` for full DynoLabs 5 reference including package management, lab operations, testing features, key files, and environment variables.
 
-### Package Management
+Key commands: `lab start/finish/grade/solve <exercise>`, `lab force <sku>` (bypass manifest), `lab version`, `lab list`, `lab status --reset`.
 
-| Command | Description |
-|---------|-------------|
-| `lab install <sku>` | Install course package (respects manifest constraints) |
-| `lab force <sku>` | Install package bypassing all constraints (for dev/QA) |
-| `lab force <sku>=<version>` | Force-install exact version |
-| `lab activate <sku>` | Switch active course without reinstalling |
-| `lab list` | List installed courses |
-| `lab version` | Show active course library and version |
-| `lab release` | Show lab CLI version |
-| `lab clean` | Remove course history and grading config |
-| `lab clean --labs` | Remove UV cache + course history + grading config |
-| `lab clean --all` | Remove everything except manifest |
-
-### Lab Operations
-
-| Command | Description |
-|---------|-------------|
-| `lab start <exercise>` | Start exercise (creates resources, copies files) |
-| `lab finish <exercise>` | Clean up exercise (removes resources) |
-| `lab grade <exercise>` | Grade exercise (Labs only) |
-| `lab solve <exercise>` | Auto-solve exercise (if supported) |
-| `lab status` | Show active lab state |
-| `lab status <exercise> --reset` | Reset stuck lab state |
-| `lab start <sku>::<exercise>` | Run exercise from specific course (namespace syntax) |
-
-### Testing (Hidden Features)
-
-| Command | Description |
-|---------|-------------|
-| `lab autotest` | Run all lab scripts in random order |
-| `lab autotest --ignore-errors` | Continue testing after failures |
-| `lab coursetest <scripts.yml>` | Sequential course workflow testing |
-
-### Key Files
-
-| Path | Description |
-|------|-------------|
-| `~/.grading/lab_manifest.json` | Maps exercise names to course SKUs and versions |
-| `~/.grading/lab_state.json` | Tracks active lab state |
-| `~/.grading/config.yaml` | Grading configuration |
-| `/etc/rht` | Workstation course info (`RHT_COURSE`, `RHT_VMTREE`, `VERSION_LOCK`) |
-
-### Environment Variables
-
-| Variable | Description |
-|----------|-------------|
-| `PYPI_URL` | Custom PyPI URL (highest priority) |
-| `PKG_ENV` | Environment: `prod`, `stage`, `factory` |
-| `UV_PYTHON_VERSION` | Override Python version for uv |
-
-### References
-
-- [Lab CLI (Rust)](https://github.com/RedHatTraining/classroom-api) — DynoLabs 5 Rust CLI source, manifest management, autotest
-- [rht-labs-core](https://github.com/RedHatTraining/rht-labs-core) — DynoLabs grading framework (Python), lab script development guides
+References: [Lab CLI (Rust)](https://github.com/RedHatTraining/classroom-api), [rht-labs-core](https://github.com/RedHatTraining/rht-labs-core)
 
 ## Cleanup
 
