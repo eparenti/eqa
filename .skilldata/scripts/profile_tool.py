@@ -8,18 +8,11 @@ Usage:
 """
 
 import argparse
-import json
 import re
 import sys
 from pathlib import Path
 
-
-def _output(data):
-    print(json.dumps(data, default=str))
-
-
-def _err(msg):
-    print(msg, file=sys.stderr)
+from eqa_common import _output, _err, json_safe
 
 
 NAVIGATOR_PATTERNS = [
@@ -133,6 +126,7 @@ def _read_all_content(epub_dir: Path) -> str:
     return '\n'.join(all_text)
 
 
+@json_safe
 def cmd_build(args):
     """Build course profile from extracted EPUB content."""
     epub_dir = Path(args.epub_extract_dir).expanduser().resolve()

@@ -2,6 +2,8 @@
 """Browser automation and web testing via Playwright.
 
 All output is JSON to stdout, diagnostics to stderr.
+Supports a persistent browser daemon to avoid relaunching Chromium for every
+operation.
 
 Usage:
     python3 web_tool.py navigate <url> [--screenshot <path>]
@@ -14,42 +16,101 @@ Usage:
     python3 web_tool.py evaluate <js_expression>
     python3 web_tool.py api-get <url> [--headers <json>]
     python3 web_tool.py api-post <url> --data <json> [--headers <json>]
+    python3 web_tool.py login <url> --username <user> --password <pass>
+    python3 web_tool.py start-daemon [--timeout 300]
+    python3 web_tool.py stop-daemon
     python3 web_tool.py close
 """
 
 import argparse
+import atexit
 import json
 import os
+import signal
+import socket
+import struct
+import subprocess
 import sys
+import threading
+import time
 
-STATE_FILE = "/tmp/eqa-web-state.json"
-
-
-def _output(data):
-    print(json.dumps(data, default=str))
+from eqa_common import _output, _err, get_cache_dir, get_state_path, load_state, save_state, json_safe
 
 
-def _err(msg):
-    print(msg, file=sys.stderr)
+STATE_FILE = get_state_path("web")
+STORAGE_STATE_FILE = os.path.join(get_cache_dir(), "web-storage.json")
+DAEMON_SOCKET_PATH = os.path.join(get_cache_dir(), "web-daemon.sock")
+DAEMON_PID_FILE = os.path.join(get_cache_dir(), "web-daemon.pid")
 
 
-def _load_state():
-    if os.path.exists(STATE_FILE):
+# ---------------------------------------------------------------------------
+# Daemon protocol helpers
+# ---------------------------------------------------------------------------
+
+def _send_message(sock, data):
+    """Send a length-prefixed JSON message over a socket."""
+    payload = json.dumps(data).encode('utf-8')
+    sock.sendall(struct.pack('!I', len(payload)) + payload)
+
+
+def _recv_message(sock):
+    """Receive a length-prefixed JSON message from a socket."""
+    raw_len = _recvall(sock, 4)
+    if not raw_len:
+        return None
+    msg_len = struct.unpack('!I', raw_len)[0]
+    data = _recvall(sock, msg_len)
+    if not data:
+        return None
+    return json.loads(data.decode('utf-8'))
+
+
+def _recvall(sock, n):
+    """Receive exactly n bytes from socket."""
+    buf = b''
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            return None
+        buf += chunk
+    return buf
+
+
+def _daemon_running():
+    """Check if daemon is running and reachable."""
+    if not os.path.exists(DAEMON_SOCKET_PATH):
+        return False
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(2)
+        s.connect(DAEMON_SOCKET_PATH)
+        _send_message(s, {"subcommand": "ping"})
+        resp = _recv_message(s)
+        s.close()
+        return resp is not None and resp.get("pong")
+    except (ConnectionRefusedError, OSError, socket.timeout):
+        # Stale socket file — clean up
         try:
-            with open(STATE_FILE) as f:
-                return json.load(f)
-        except (json.JSONDecodeError, IOError):
+            os.unlink(DAEMON_SOCKET_PATH)
+        except OSError:
             pass
-    return {}
+        return False
 
 
-def _save_state(state):
-    with open(STATE_FILE, 'w') as f:
-        json.dump(state, f)
+def _send_to_daemon(subcommand, args_dict):
+    """Send a command to the daemon, return the JSON response."""
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(120)
+    s.connect(DAEMON_SOCKET_PATH)
+    _send_message(s, {"subcommand": subcommand, "args": args_dict})
+    resp = _recv_message(s)
+    s.close()
+    return resp
 
 
-STORAGE_STATE_FILE = "/tmp/eqa-web-storage.json"
-
+# ---------------------------------------------------------------------------
+# Browser helpers (non-daemon path)
+# ---------------------------------------------------------------------------
 
 def _get_browser():
     """Get or start Playwright browser and page.
@@ -63,7 +124,7 @@ def _get_browser():
         _output({"success": False, "error": "playwright not installed. Run: pip install playwright && playwright install chromium"})
         sys.exit(1)
 
-    state = _load_state()
+    state = load_state(STATE_FILE)
 
     pw = sync_playwright().start()
     try:
@@ -105,9 +166,9 @@ def _cleanup(pw, browser, page, save_url=True):
     """Save state, cookies, and close browser."""
     if save_url:
         try:
-            state = _load_state()
+            state = load_state(STATE_FILE)
             state["last_url"] = page.url
-            _save_state(state)
+            save_state(STATE_FILE, state)
         except Exception:
             pass
         # Persist cookies and storage state for next invocation
@@ -122,6 +183,285 @@ def _cleanup(pw, browser, page, save_url=True):
         pass
 
 
+# ---------------------------------------------------------------------------
+# Daemon implementation
+# ---------------------------------------------------------------------------
+
+class BrowserDaemon:
+    """Unix socket daemon that keeps Chromium alive between commands."""
+
+    def __init__(self, idle_timeout=300):
+        self.idle_timeout = idle_timeout
+        self.pw = None
+        self.browser = None
+        self.context = None
+        self.page = None
+        self.last_activity = time.time()
+        self._shutdown = False
+
+    def start(self):
+        """Launch browser and listen on Unix socket."""
+        from playwright.sync_api import sync_playwright
+
+        # Clean up stale socket
+        if os.path.exists(DAEMON_SOCKET_PATH):
+            os.unlink(DAEMON_SOCKET_PATH)
+
+        # Write PID
+        with open(DAEMON_PID_FILE, 'w') as f:
+            f.write(str(os.getpid()))
+
+        # Start browser
+        self.pw = sync_playwright().start()
+        self.browser = self.pw.chromium.launch(headless=True)
+
+        storage_state = STORAGE_STATE_FILE if os.path.exists(STORAGE_STATE_FILE) else None
+        self.context = self.browser.new_context(
+            ignore_https_errors=True,
+            viewport={"width": 1280, "height": 720},
+            storage_state=storage_state,
+        )
+        self.page = self.context.new_page()
+
+        # Restore last URL
+        state = load_state(STATE_FILE)
+        last_url = state.get("last_url")
+        if last_url:
+            try:
+                self.page.goto(last_url, wait_until="domcontentloaded", timeout=15000)
+            except Exception:
+                pass
+
+        # Set up signal handlers
+        signal.signal(signal.SIGTERM, self._handle_signal)
+        signal.signal(signal.SIGINT, self._handle_signal)
+        atexit.register(self._cleanup)
+
+        # Listen
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(DAEMON_SOCKET_PATH)
+        os.chmod(DAEMON_SOCKET_PATH, 0o600)
+        server.listen(1)
+        server.settimeout(10)  # check idle timeout periodically
+
+        _err(f"Browser daemon started (PID {os.getpid()}, idle timeout {self.idle_timeout}s)")
+
+        while not self._shutdown:
+            # Check idle timeout
+            if time.time() - self.last_activity > self.idle_timeout:
+                _err("Idle timeout reached, shutting down daemon")
+                break
+
+            try:
+                conn, _ = server.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+
+            try:
+                msg = _recv_message(conn)
+                if msg:
+                    self.last_activity = time.time()
+                    resp = self._handle_command(msg)
+                    _send_message(conn, resp)
+                conn.close()
+            except Exception as e:
+                _err(f"Daemon error handling command: {e}")
+                try:
+                    _send_message(conn, {"success": False, "error": str(e)})
+                    conn.close()
+                except Exception:
+                    pass
+
+        server.close()
+        self._cleanup()
+
+    def _handle_signal(self, signum, frame):
+        self._shutdown = True
+
+    def _handle_command(self, msg):
+        """Execute a browser command and return the result."""
+        subcmd = msg.get("subcommand", "")
+        args = msg.get("args", {})
+
+        if subcmd == "ping":
+            return {"pong": True}
+        elif subcmd == "shutdown":
+            self._shutdown = True
+            return {"success": True}
+        elif subcmd == "navigate":
+            return self._do_navigate(args)
+        elif subcmd == "click":
+            return self._do_click(args)
+        elif subcmd == "fill":
+            return self._do_fill(args)
+        elif subcmd == "text":
+            return self._do_text(args)
+        elif subcmd == "screenshot":
+            return self._do_screenshot(args)
+        elif subcmd == "page-text":
+            return self._do_page_text(args)
+        elif subcmd == "wait":
+            return self._do_wait(args)
+        elif subcmd == "evaluate":
+            return self._do_evaluate(args)
+        elif subcmd == "login":
+            return self._do_login(args)
+        else:
+            return {"success": False, "error": f"Unknown daemon command: {subcmd}"}
+
+    def _save_after_command(self):
+        """Save state after each command for crash resilience."""
+        try:
+            state = load_state(STATE_FILE)
+            state["last_url"] = self.page.url
+            save_state(STATE_FILE, state)
+        except Exception:
+            pass
+        try:
+            self.page.context.storage_state(path=STORAGE_STATE_FILE)
+        except Exception:
+            pass
+
+    def _do_navigate(self, args):
+        try:
+            self.page.goto(args["url"], wait_until="domcontentloaded", timeout=30000)
+            result = {"success": True, "url": self.page.url, "title": self.page.title()}
+            if args.get("screenshot"):
+                self.page.screenshot(path=args["screenshot"])
+                result["screenshot"] = args["screenshot"]
+            self._save_after_command()
+            return result
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def _do_click(self, args):
+        try:
+            self.page.click(args["selector"], timeout=10000)
+            self.page.wait_for_load_state("domcontentloaded")
+            result = {"success": True, "url": self.page.url}
+            if args.get("screenshot"):
+                self.page.screenshot(path=args["screenshot"])
+                result["screenshot"] = args["screenshot"]
+            self._save_after_command()
+            return result
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def _do_fill(self, args):
+        try:
+            self.page.fill(args["selector"], args["value"], timeout=10000)
+            self._save_after_command()
+            return {"success": True}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def _do_text(self, args):
+        try:
+            text = self.page.text_content(args["selector"], timeout=10000)
+            return {"success": True, "text": text}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def _do_screenshot(self, args):
+        try:
+            self.page.screenshot(path=args["path"])
+            return {"success": True, "path": args["path"], "url": self.page.url}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def _do_page_text(self, args):
+        try:
+            text = self.page.inner_text("body")
+            return {"success": True, "text": text[:5000], "url": self.page.url, "title": self.page.title()}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def _do_wait(self, args):
+        try:
+            self.page.wait_for_selector(args["selector"], timeout=args.get("timeout", 10000))
+            return {"success": True}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def _do_evaluate(self, args):
+        try:
+            result = self.page.evaluate(args["expression"])
+            return {"success": True, "result": result}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def _do_login(self, args):
+        try:
+            import time as _time
+
+            self.page.goto(args["url"], timeout=30000)
+            self.page.wait_for_selector(args.get("username_selector", "#inputUsername"), timeout=30000)
+            _time.sleep(1)
+
+            self.page.fill(args.get("username_selector", "#inputUsername"), args["username"], timeout=10000)
+            self.page.fill(args.get("password_selector", "#inputPassword"), args["password"], timeout=10000)
+
+            self.page.click(args.get("submit_selector", "button[type='submit']"), timeout=10000)
+            _time.sleep(10)
+
+            if args.get("then"):
+                self.page.goto(args["then"], wait_until="domcontentloaded", timeout=30000)
+                _time.sleep(5)
+                try:
+                    self.page.wait_for_selector("nav, [data-test], .pf-v6-c-page, .co-m-pane__body", timeout=15000)
+                except Exception:
+                    pass
+
+            result = {
+                "success": True,
+                "url": self.page.url,
+                "title": self.page.title(),
+            }
+
+            if args.get("then"):
+                try:
+                    result["text"] = self.page.inner_text("body")[:5000]
+                except Exception:
+                    result["text"] = ""
+
+            if args.get("screenshot"):
+                self.page.screenshot(path=args["screenshot"])
+                result["screenshot"] = args["screenshot"]
+
+            self._save_after_command()
+            return result
+        except Exception as e:
+            return {"success": False, "error": str(e), "url": getattr(self.page, 'url', '')}
+
+    def _cleanup(self):
+        """Clean shutdown of browser and socket."""
+        try:
+            self.page.context.storage_state(path=STORAGE_STATE_FILE)
+        except Exception:
+            pass
+        try:
+            self.browser.close()
+        except Exception:
+            pass
+        try:
+            self.pw.stop()
+        except Exception:
+            pass
+        for f in [DAEMON_SOCKET_PATH, DAEMON_PID_FILE]:
+            try:
+                if os.path.exists(f):
+                    os.unlink(f)
+            except OSError:
+                pass
+
+
+# ---------------------------------------------------------------------------
+# Subcommand handlers
+# ---------------------------------------------------------------------------
+
+@json_safe
 def cmd_navigate(args):
     """Navigate to a URL."""
     pw, browser, page = _get_browser()
@@ -143,6 +483,7 @@ def cmd_navigate(args):
         _cleanup(pw, browser, page)
 
 
+@json_safe
 def cmd_click(args):
     """Click an element by selector."""
     pw, browser, page = _get_browser()
@@ -163,6 +504,7 @@ def cmd_click(args):
         _cleanup(pw, browser, page)
 
 
+@json_safe
 def cmd_fill(args):
     """Fill a form field."""
     pw, browser, page = _get_browser()
@@ -175,6 +517,7 @@ def cmd_fill(args):
         _cleanup(pw, browser, page)
 
 
+@json_safe
 def cmd_text(args):
     """Get text content of an element."""
     pw, browser, page = _get_browser()
@@ -187,6 +530,7 @@ def cmd_text(args):
         _cleanup(pw, browser, page)
 
 
+@json_safe
 def cmd_screenshot(args):
     """Take a screenshot of the current page."""
     pw, browser, page = _get_browser()
@@ -199,6 +543,7 @@ def cmd_screenshot(args):
         _cleanup(pw, browser, page)
 
 
+@json_safe
 def cmd_page_text(args):
     """Get full page text content."""
     pw, browser, page = _get_browser()
@@ -211,6 +556,7 @@ def cmd_page_text(args):
         _cleanup(pw, browser, page)
 
 
+@json_safe
 def cmd_wait(args):
     """Wait for an element to appear."""
     pw, browser, page = _get_browser()
@@ -223,6 +569,7 @@ def cmd_wait(args):
         _cleanup(pw, browser, page)
 
 
+@json_safe
 def cmd_evaluate(args):
     """Evaluate JavaScript expression on the page."""
     pw, browser, page = _get_browser()
@@ -235,6 +582,7 @@ def cmd_evaluate(args):
         _cleanup(pw, browser, page)
 
 
+@json_safe
 def cmd_api_get(args):
     """Make an HTTP GET request (no browser needed)."""
     import urllib.request
@@ -259,6 +607,7 @@ def cmd_api_get(args):
         _output({"success": False, "error": str(e)})
 
 
+@json_safe
 def cmd_api_post(args):
     """Make an HTTP POST request (no browser needed)."""
     import urllib.request
@@ -287,13 +636,18 @@ def cmd_api_post(args):
         _output({"success": False, "error": str(e)})
 
 
+@json_safe
 def cmd_login(args):
     """Login to a web application (navigate + fill + submit in one session).
 
     Handles the full login flow in a single browser session to avoid
-    losing form state between separate fill/click calls. Use --then
-    to navigate to a specific page after login (e.g., the VMs page).
+    losing form state between separate fill/click calls.
     """
+    password = os.environ.get("EQA_WEB_PASSWORD") or args.password
+    if not password:
+        _output({"success": False, "error": "Password required. Set EQA_WEB_PASSWORD or use --password."})
+        return
+
     pw, browser, page = _get_browser()
     try:
         import time as _time
@@ -304,7 +658,7 @@ def cmd_login(args):
         _time.sleep(1)
 
         page.fill(args.username_selector, args.username, timeout=10000)
-        page.fill(args.password_selector, args.password, timeout=10000)
+        page.fill(args.password_selector, password, timeout=10000)
 
         page.click(args.submit_selector, timeout=10000)
         _time.sleep(10)  # Wait for OAuth redirect chain to complete
@@ -344,12 +698,96 @@ def cmd_login(args):
         _cleanup(pw, browser, page)
 
 
+@json_safe
 def cmd_close(args):
-    """Clear web state and session cookies."""
+    """Clear web state and session cookies. Also stops daemon if running."""
+    # Stop daemon if running
+    if _daemon_running():
+        try:
+            _send_to_daemon("shutdown", {})
+        except Exception:
+            pass
+
     for f in [STATE_FILE, STORAGE_STATE_FILE]:
         if os.path.exists(f):
             os.unlink(f)
     _output({"success": True})
+
+
+@json_safe
+def cmd_daemon(args):
+    """Internal: run the browser daemon (foreground)."""
+    daemon = BrowserDaemon(idle_timeout=args.timeout)
+    daemon.start()
+
+
+@json_safe
+def cmd_start_daemon(args):
+    """Start the browser daemon in the background."""
+    if _daemon_running():
+        _output({"success": True, "message": "Daemon already running"})
+        return
+
+    # Launch daemon as a detached subprocess
+    script_path = os.path.abspath(__file__)
+    proc = subprocess.Popen(
+        [sys.executable, script_path, "daemon", "--timeout", str(args.timeout)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+    # Wait for daemon to become reachable
+    for _ in range(30):
+        time.sleep(0.5)
+        if _daemon_running():
+            _output({"success": True, "pid": proc.pid, "socket": DAEMON_SOCKET_PATH})
+            return
+
+    _output({"success": False, "error": "Daemon did not start in time"})
+
+
+@json_safe
+def cmd_stop_daemon(args):
+    """Stop the browser daemon."""
+    if not _daemon_running():
+        _output({"success": True, "message": "Daemon not running"})
+        return
+
+    try:
+        resp = _send_to_daemon("shutdown", {})
+        _output({"success": True, "message": "Daemon stopped"})
+    except Exception as e:
+        # Try SIGTERM via PID file
+        if os.path.exists(DAEMON_PID_FILE):
+            try:
+                with open(DAEMON_PID_FILE) as f:
+                    pid = int(f.read().strip())
+                os.kill(pid, signal.SIGTERM)
+                _output({"success": True, "message": f"Sent SIGTERM to {pid}"})
+                return
+            except Exception:
+                pass
+        _output({"success": False, "error": str(e)})
+
+
+# ---------------------------------------------------------------------------
+# Daemon-aware dispatch
+# ---------------------------------------------------------------------------
+
+# Subcommands that can be routed through the daemon
+_DAEMON_COMMANDS = {
+    "navigate", "click", "fill", "text", "screenshot",
+    "page-text", "wait", "evaluate", "login",
+}
+
+
+def _args_to_dict(args):
+    """Convert argparse Namespace to a dict suitable for daemon dispatch."""
+    d = vars(args).copy()
+    d.pop("func", None)
+    d.pop("subcommand", None)
+    return d
 
 
 def main():
@@ -367,7 +805,7 @@ def main():
     p.add_argument("--password-selector", default="#inputPassword")
     p.add_argument("--submit-selector", default="button[type='submit']")
     p.add_argument("--username", required=True)
-    p.add_argument("--password", required=True)
+    p.add_argument("--password", default=None)
     p.add_argument("--then", default=None, help="URL to navigate to after login")
     p.add_argument("--screenshot", default=None)
     p.set_defaults(func=cmd_login)
@@ -416,7 +854,29 @@ def main():
     p = subparsers.add_parser("close")
     p.set_defaults(func=cmd_close)
 
+    p = subparsers.add_parser("daemon")
+    p.add_argument("--timeout", type=int, default=300)
+    p.set_defaults(func=cmd_daemon)
+
+    p = subparsers.add_parser("start-daemon")
+    p.add_argument("--timeout", type=int, default=300)
+    p.set_defaults(func=cmd_start_daemon)
+
+    p = subparsers.add_parser("stop-daemon")
+    p.set_defaults(func=cmd_stop_daemon)
+
     args = parser.parse_args()
+
+    # Route browser commands through daemon if it's running
+    if args.subcommand in _DAEMON_COMMANDS and _daemon_running():
+        try:
+            resp = _send_to_daemon(args.subcommand, _args_to_dict(args))
+            _output(resp)
+            return
+        except Exception:
+            # Fall back to per-command browser launch
+            _err("Daemon connection failed, falling back to direct browser launch")
+
     args.func(args)
 
 

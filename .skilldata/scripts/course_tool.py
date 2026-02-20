@@ -9,7 +9,6 @@ Usage:
 """
 
 import argparse
-import json
 import os
 import re
 import shutil
@@ -19,15 +18,10 @@ from pathlib import Path
 
 import yaml
 
-
-def _output(data):
-    print(json.dumps(data, default=str))
+from eqa_common import _output, _err, json_safe
 
 
-def _err(msg):
-    print(msg, file=sys.stderr)
-
-
+@json_safe
 def cmd_resolve(args):
     """Resolve input (lesson code, path, course code) to epub_path + lesson_path."""
     input_str = args.input
@@ -290,6 +284,7 @@ def _try_build_epub(directory: Path) -> Path:
     return None
 
 
+@json_safe
 def cmd_detect(args):
     """Auto-detect course metadata and structure from repo."""
     repo_path = Path(args.repo_path).expanduser().resolve()

@@ -11,13 +11,10 @@ Usage:
 """
 
 import argparse
-import json
 import re
 import sys
 
-
-def _output(data):
-    print(json.dumps(data, default=str))
+from eqa_common import _output, _err, json_safe
 
 
 ERROR_PATTERNS = [
@@ -215,12 +212,14 @@ def diagnose(text: str) -> dict:
     }
 
 
+@json_safe
 def cmd_analyze(args):
     """Analyze error text for known patterns."""
     if args.text == "-":
         text = sys.stdin.read()
     elif args.file:
-        text = open(args.file).read()
+        with open(args.file) as f:
+            text = f.read()
     else:
         text = args.text
 

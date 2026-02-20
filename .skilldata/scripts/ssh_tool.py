@@ -2,7 +2,7 @@
 """SSH ControlMaster management and remote command execution.
 
 All output is JSON to stdout, diagnostics to stderr.
-State persists across invocations via /tmp/eqa-ssh-state.json.
+State persists across invocations via ~/.cache/eqa/ssh-state.json.
 
 Usage:
     python3 ssh_tool.py connect [--host workstation]
@@ -19,16 +19,19 @@ Usage:
 
 import argparse
 import base64
+import functools
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
-import tempfile
 import time
 
+from eqa_common import _output, _err, get_cache_dir, get_state_path, load_state, save_state, json_safe
 
-STATE_FILE = "/tmp/eqa-ssh-state.json"
+
+STATE_FILE = get_state_path("ssh")
 
 
 def _strip_ansi(text: str, strip_spinners: bool = True) -> str:
@@ -65,23 +68,6 @@ def _strip_ansi(text: str, strip_spinners: bool = True) -> str:
     return '\n'.join(filtered)
 
 
-def _load_state() -> dict:
-    """Load persisted SSH state."""
-    if os.path.exists(STATE_FILE):
-        try:
-            with open(STATE_FILE) as f:
-                return json.load(f)
-        except (json.JSONDecodeError, IOError):
-            pass
-    return {}
-
-
-def _save_state(state: dict):
-    """Persist SSH state."""
-    with open(STATE_FILE, 'w') as f:
-        json.dump(state, f)
-
-
 def _ssh_opts(state: dict) -> list:
     """Common SSH options."""
     return [
@@ -92,19 +78,41 @@ def _ssh_opts(state: dict) -> list:
     ]
 
 
-def _output(data: dict):
-    """Print JSON to stdout."""
-    print(json.dumps(data))
+def _ssh_exec(state, cmd, timeout=120, input_data=None):
+    """Run command over SSH. Returns (success, stdout, stderr, rc, duration)."""
+    start_time = time.time()
+    try:
+        result = subprocess.run(
+            ['ssh'] + _ssh_opts(state) + [state["host"], cmd],
+            capture_output=True, text=True, timeout=timeout,
+            input=input_data,
+        )
+        duration = time.time() - start_time
+        return (
+            result.returncode == 0,
+            _strip_ansi(result.stdout),
+            _strip_ansi(result.stderr),
+            result.returncode,
+            round(duration, 2),
+        )
+    except subprocess.TimeoutExpired:
+        duration = time.time() - start_time
+        return (False, "", f"Command timed out after {timeout}s", -1, round(duration, 2))
+    except Exception as e:
+        duration = time.time() - start_time
+        return (False, "", f"Execution error: {e}", -1, round(duration, 2))
 
 
-def _err(msg: str):
-    """Print diagnostic to stderr."""
-    print(msg, file=sys.stderr)
-
-
-def _shell_quote(s: str) -> str:
-    """Quote a string for safe shell use."""
-    return "'" + s.replace("'", "'\\''") + "'"
+def requires_connection(func):
+    """Decorator: load state and verify connection before running command."""
+    @functools.wraps(func)
+    def wrapper(args):
+        state = load_state(STATE_FILE)
+        if not state:
+            _output({"success": False, "error": "Not connected. Run 'connect' first."})
+            return
+        return func(args, state)
+    return wrapper
 
 
 def _detect_workstation() -> str:
@@ -151,75 +159,19 @@ def _detect_workstation() -> str:
     return "workstation"
 
 
-def cmd_connect(args):
-    """Start ControlMaster, detect framework, persist state."""
-    host = args.host or _detect_workstation()
-    control_dir = tempfile.mkdtemp(prefix="eqa-ssh-")
-    control_path = os.path.join(control_dir, f"{host}.sock")
-
-    _err(f"Connecting to {host}...")
-
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            cmd = [
-                'ssh',
-                '-o', f'ControlPath={control_path}',
-                '-o', 'ControlMaster=yes',
-                '-o', 'ControlPersist=600',
-                '-o', 'ConnectTimeout=15',
-                '-o', 'ServerAliveInterval=30',
-                '-o', 'ServerAliveCountMax=3',
-                '-N', '-f',
-                host,
-            ]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-            if result.returncode == 0:
-                # Verify connection
-                opts = [
-                    '-o', f'ControlPath={control_path}',
-                    '-o', 'ConnectTimeout=10',
-                ]
-                verify = subprocess.run(
-                    ['ssh'] + opts + [host, 'echo', 'connected'],
-                    capture_output=True, text=True, timeout=10,
-                )
-                if verify.returncode == 0 and 'connected' in verify.stdout:
-                    break
-        except (subprocess.TimeoutExpired, Exception) as e:
-            _err(f"Attempt {attempt + 1} failed: {e}")
-
-        if attempt < max_retries - 1:
-            delay = 2.0 * (2 ** attempt)
-            _err(f"Retrying in {delay}s...")
-            time.sleep(delay)
-    else:
-        _output({"success": False, "error": f"Connection failed after {max_retries} attempts"})
-        return
-
-    # Save initial state
-    state = {
-        "control_path": control_path,
-        "control_dir": control_dir,
-        "host": host,
-        "framework": None,
-        "framework_prefix": None,
-    }
-
-    # Detect lab framework
-    framework, prefix = _detect_framework(state)
-    state["framework"] = framework
-    state["framework_prefix"] = prefix
-
-    _save_state(state)
-
-    _output({
-        "success": True,
-        "host": host,
-        "control_path": control_path,
-        "framework": framework,
-        "framework_prefix": prefix,
-    })
+def _check_connection(state: dict) -> bool:
+    """Verify ControlMaster socket is still alive."""
+    control_path = state.get("control_path", "")
+    if not os.path.exists(control_path):
+        return False
+    try:
+        result = subprocess.run(
+            ['ssh', '-o', f'ControlPath={control_path}', '-O', 'check', state["host"]],
+            capture_output=True, text=True, timeout=5,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
 
 
 def _detect_framework(state: dict) -> tuple:
@@ -265,24 +217,88 @@ def _detect_framework(state: dict) -> tuple:
     return ('unknown', 'lab')
 
 
-def _check_connection(state: dict) -> bool:
-    """Verify ControlMaster socket is still alive."""
-    control_path = state.get("control_path", "")
-    if not os.path.exists(control_path):
-        return False
-    try:
-        result = subprocess.run(
-            ['ssh', '-o', f'ControlPath={control_path}', '-O', 'check', state["host"]],
-            capture_output=True, text=True, timeout=5,
-        )
-        return result.returncode == 0
-    except Exception:
-        return False
+@json_safe
+def cmd_connect(args):
+    """Start ControlMaster, detect framework, persist state."""
+    host = args.host or _detect_workstation()
+    cache_dir = get_cache_dir()
+    control_path = os.path.join(cache_dir, f"ssh-{host}.sock")
+
+    # Clean up stale socket from a dead connection
+    old_state = load_state(STATE_FILE)
+    if old_state and not _check_connection(old_state):
+        old_socket = old_state.get("control_path", "")
+        if old_socket and os.path.exists(old_socket):
+            os.unlink(old_socket)
+
+    _err(f"Connecting to {host}...")
+
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            cmd = [
+                'ssh',
+                '-o', f'ControlPath={control_path}',
+                '-o', 'ControlMaster=yes',
+                '-o', 'ControlPersist=600',
+                '-o', 'ConnectTimeout=15',
+                '-o', 'ServerAliveInterval=30',
+                '-o', 'ServerAliveCountMax=3',
+                '-N', '-f',
+                host,
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            if result.returncode == 0:
+                # Verify connection
+                opts = [
+                    '-o', f'ControlPath={control_path}',
+                    '-o', 'ConnectTimeout=10',
+                ]
+                verify = subprocess.run(
+                    ['ssh'] + opts + [host, 'echo', 'connected'],
+                    capture_output=True, text=True, timeout=10,
+                )
+                if verify.returncode == 0 and 'connected' in verify.stdout:
+                    break
+        except (subprocess.TimeoutExpired, Exception) as e:
+            _err(f"Attempt {attempt + 1} failed: {e}")
+
+        if attempt < max_retries - 1:
+            delay = 2.0 * (2 ** attempt)
+            _err(f"Retrying in {delay}s...")
+            time.sleep(delay)
+    else:
+        _output({"success": False, "error": f"Connection failed after {max_retries} attempts"})
+        return
+
+    # Save initial state
+    state = {
+        "control_path": control_path,
+        "host": host,
+        "framework": None,
+        "framework_prefix": None,
+    }
+
+    # Detect lab framework
+    framework, prefix = _detect_framework(state)
+    state["framework"] = framework
+    state["framework_prefix"] = prefix
+
+    save_state(STATE_FILE, state)
+
+    _output({
+        "success": True,
+        "host": host,
+        "control_path": control_path,
+        "framework": framework,
+        "framework_prefix": prefix,
+    })
 
 
+@json_safe
 def cmd_status(args):
     """Check connection status, framework info, and disk space."""
-    state = _load_state()
+    state = load_state(STATE_FILE)
     if not state:
         _output({"success": True, "connected": False, "message": "No active connection"})
         return
@@ -326,13 +342,10 @@ def cmd_status(args):
     _output(result)
 
 
-def cmd_tunnel(args):
+@json_safe
+@requires_connection
+def cmd_tunnel(args, state):
     """Generate sshuttle command for classroom network tunnel."""
-    state = _load_state()
-    if not state:
-        _output({"success": False, "error": "Not connected. Run 'connect' first."})
-        return
-
     if not _check_connection(state):
         _output({"success": False, "error": "Connection lost. Run 'connect' again."})
         return
@@ -361,9 +374,10 @@ def cmd_tunnel(args):
     })
 
 
+@json_safe
 def cmd_run(args):
     """Execute command via ControlMaster."""
-    state = _load_state()
+    state = load_state(STATE_FILE)
     if not state:
         _output({"success": False, "error": "Not connected. Run 'connect' first."})
         return
@@ -371,13 +385,17 @@ def cmd_run(args):
     # Check for stale socket
     if not _check_connection(state):
         _err("ControlMaster socket is stale, reconnecting...")
-        # Save old paths for cleanup
-        old_control_path = state.get("control_path", "")
-        old_control_dir = state.get("control_dir", "")
         # Attempt reconnect
         host = state["host"]
-        control_dir = tempfile.mkdtemp(prefix="eqa-ssh-")
-        control_path = os.path.join(control_dir, f"{host}.sock")
+        cache_dir = get_cache_dir()
+        control_path = os.path.join(cache_dir, f"ssh-{host}.sock")
+        # Clean up old socket
+        old_control_path = state.get("control_path", "")
+        if old_control_path and os.path.exists(old_control_path):
+            try:
+                os.unlink(old_control_path)
+            except OSError:
+                pass
         try:
             cmd = [
                 'ssh',
@@ -391,20 +409,8 @@ def cmd_run(args):
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
             if result.returncode == 0:
                 state["control_path"] = control_path
-                state["control_dir"] = control_dir
-                _save_state(state)
+                save_state(STATE_FILE, state)
                 _err("Reconnected successfully")
-                # Clean up old socket and directory
-                if old_control_path and os.path.exists(old_control_path):
-                    try:
-                        os.unlink(old_control_path)
-                    except OSError:
-                        pass
-                if old_control_dir and old_control_dir != control_dir and os.path.exists(old_control_dir):
-                    try:
-                        os.rmdir(old_control_dir)
-                    except OSError:
-                        pass
             else:
                 _output({"success": False, "error": "Connection lost and reconnect failed. Run 'connect' again."})
                 return
@@ -414,47 +420,21 @@ def cmd_run(args):
 
     command = args.command
     timeout = args.timeout
-    start_time = time.time()
 
-    try:
-        result = subprocess.run(
-            ['ssh'] + _ssh_opts(state) + [state["host"], command],
-            capture_output=True, text=True, timeout=timeout,
-        )
-        duration = time.time() - start_time
-
-        _output({
-            "success": result.returncode == 0,
-            "return_code": result.returncode,
-            "stdout": _strip_ansi(result.stdout),
-            "stderr": _strip_ansi(result.stderr),
-            "duration": round(duration, 2),
-        })
-    except subprocess.TimeoutExpired:
-        _output({
-            "success": False,
-            "return_code": -1,
-            "stdout": "",
-            "stderr": f"Command timed out after {timeout}s",
-            "duration": timeout,
-        })
-    except Exception as e:
-        _output({
-            "success": False,
-            "return_code": -1,
-            "stdout": "",
-            "stderr": f"Execution error: {e}",
-            "duration": round(time.time() - start_time, 2),
-        })
+    ok, stdout, stderr, rc, duration = _ssh_exec(state, command, timeout=timeout)
+    _output({
+        "success": ok,
+        "return_code": rc,
+        "stdout": stdout,
+        "stderr": stderr,
+        "duration": duration,
+    })
 
 
-def cmd_lab(args):
+@json_safe
+@requires_connection
+def cmd_lab(args, state):
     """Run framework-aware lab command."""
-    state = _load_state()
-    if not state:
-        _output({"success": False, "error": "Not connected. Run 'connect' first."})
-        return
-
     action = args.action
     exercise = args.exercise
     timeout = args.timeout
@@ -463,93 +443,60 @@ def cmd_lab(args):
 
     # 'force' bypasses framework prefix, uses raw exercise as SKU
     if action == 'force':
-        cmd = f"lab force {exercise}"
+        cmd = f"lab force {shlex.quote(exercise)}"
     else:
-        # Strip -ge/-lab suffix
         lab_name = exercise
-        cmd = f"{prefix} {action} {lab_name}"
+        cmd = f"{prefix} {action} {shlex.quote(lab_name)}"
     _err(f"Running: {cmd} (framework: {framework})")
 
-    start_time = time.time()
-    try:
-        result = subprocess.run(
-            ['ssh'] + _ssh_opts(state) + [state["host"], cmd],
-            capture_output=True, text=True, timeout=timeout,
-        )
-        duration = time.time() - start_time
-        stdout = _strip_ansi(result.stdout)
-        stderr = _strip_ansi(result.stderr)
-        success = result.returncode == 0
+    ok, stdout, stderr, rc, duration = _ssh_exec(state, cmd, timeout=timeout)
+    success = ok
 
-        # If lab start fails or warns about a blocking lab, finish it and retry.
-        # Some frameworks return exit code 0 but print a warning with
-        # "lab finish <name>" in stdout instead of failing outright.
-        if action == 'start':
-            output = stdout + stderr
-            match = re.search(r'lab finish\s+(\S+)', output)
-            if match:
-                blocking_lab = match.group(1)
-                _err(f"Finishing blocking lab: {blocking_lab}")
-                subprocess.run(
-                    ['ssh'] + _ssh_opts(state) + [state["host"], f"{prefix} finish {blocking_lab}"],
-                    capture_output=True, text=True, timeout=120,
-                )
-                _err(f"Retrying: {cmd}")
-                result = subprocess.run(
-                    ['ssh'] + _ssh_opts(state) + [state["host"], cmd],
-                    capture_output=True, text=True, timeout=timeout,
-                )
-                duration = time.time() - start_time
-                stdout = _strip_ansi(result.stdout)
-                stderr = _strip_ansi(result.stderr)
-                success = result.returncode == 0
+    # If lab start fails or warns about a blocking lab, finish it and retry.
+    if action == 'start':
+        output = stdout + stderr
+        match = re.search(r'lab finish\s+(\S+)', output)
+        if match:
+            blocking_lab = match.group(1)
+            _err(f"Finishing blocking lab: {blocking_lab}")
+            _ssh_exec(state, f"{prefix} finish {shlex.quote(blocking_lab)}", timeout=120)
+            _err(f"Retrying: {cmd}")
+            ok, stdout, stderr, rc, duration = _ssh_exec(state, cmd, timeout=timeout)
+            success = ok
 
-        # Check stdout for FAIL indicators (start/finish only)
-        if success and action in ('start', 'finish'):
-            if re.search(r'\bFAIL\b', stdout):
-                success = False
+    # Check stdout for FAIL indicators (start/finish only)
+    if success and action in ('start', 'finish'):
+        if re.search(r'\bFAIL\b', stdout):
+            success = False
 
-        output_data = {
-            "success": success,
-            "return_code": result.returncode,
-            "stdout": stdout,
-            "stderr": stderr,
-            "duration": round(duration, 2),
-            "framework": framework,
-            "command": cmd,
-        }
+    output_data = {
+        "success": success,
+        "return_code": rc,
+        "stdout": stdout,
+        "stderr": stderr,
+        "duration": duration,
+        "framework": framework,
+        "command": cmd,
+    }
 
-        # Parse grade check results for structured output
-        if action == 'grade':
-            checks = []
-            for line in stdout.split('\n'):
-                m = re.match(r'\s*(PASS|FAIL)\s+(.+)', line)
-                if m:
-                    checks.append({"result": m.group(1), "description": m.group(2).strip()})
-            output_data["checks"] = checks
-            output_data["all_pass"] = all(c["result"] == "PASS" for c in checks) if checks else None
-            output_data["all_fail"] = all(c["result"] == "FAIL" for c in checks) if checks else None
+    # Parse grade check results for structured output
+    if action == 'grade':
+        checks = []
+        for line in stdout.split('\n'):
+            m = re.match(r'\s*(PASS|FAIL)\s+(.+)', line)
+            if m:
+                checks.append({"result": m.group(1), "description": m.group(2).strip()})
+        output_data["checks"] = checks
+        output_data["all_pass"] = all(c["result"] == "PASS" for c in checks) if checks else None
+        output_data["all_fail"] = all(c["result"] == "FAIL" for c in checks) if checks else None
 
-        _output(output_data)
-    except subprocess.TimeoutExpired:
-        _output({
-            "success": False,
-            "return_code": -1,
-            "stdout": "",
-            "stderr": f"Lab command timed out after {timeout}s",
-            "duration": timeout,
-            "framework": framework,
-            "command": cmd,
-        })
+    _output(output_data)
 
 
-def cmd_interactive(args):
+@json_safe
+@requires_connection
+def cmd_interactive(args, state):
     """Execute interactive command via pexpect."""
-    state = _load_state()
-    if not state:
-        _output({"success": False, "error": "Not connected. Run 'connect' first."})
-        return
-
     try:
         import pexpect
     except ImportError:
@@ -615,109 +562,81 @@ def cmd_interactive(args):
         })
 
 
-def cmd_vm_disks(args):
+@json_safe
+@requires_connection
+def cmd_vm_disks(args, state):
     """List disks attached to a KubeVirt VM via virsh domblklist.
 
     Returns parsed disk info as JSON array.
     """
-    state = _load_state()
-    if not state:
-        _output({"success": False, "error": "Not connected. Run 'connect' first."})
-        return
-
     vm_name = args.vm_name
     namespace = args.namespace
     timeout = args.timeout
 
-    start_time = time.time()
-
     # Get the virt-launcher pod name
     pod_cmd = (
-        f"oc get pods -n {namespace} -l vm.kubevirt.io/name={vm_name} "
+        f"oc get pods -n {shlex.quote(namespace)} -l vm.kubevirt.io/name={shlex.quote(vm_name)} "
         f"--no-headers -o custom-columns=':metadata.name' 2>&1"
     )
-    try:
-        result = subprocess.run(
-            ['ssh'] + _ssh_opts(state) + [state["host"], pod_cmd],
-            capture_output=True, text=True, timeout=30,
-        )
-        pod_name = result.stdout.strip()
-        if not pod_name or result.returncode != 0:
-            _output({
-                "success": False,
-                "error": f"No virt-launcher pod found for VM {vm_name} in {namespace}",
-                "duration": round(time.time() - start_time, 2),
+    ok, stdout, stderr, rc, duration = _ssh_exec(state, pod_cmd, timeout=30)
+    pod_name = stdout.strip()
+    if not pod_name or not ok:
+        _output({
+            "success": False,
+            "error": f"No virt-launcher pod found for VM {vm_name} in {namespace}",
+            "duration": duration,
+        })
+        return
+
+    # Run virsh domblklist
+    virsh_cmd = f"oc exec -n {shlex.quote(namespace)} {shlex.quote(pod_name)} -- virsh domblklist 1 2>&1"
+    ok, stdout, stderr, rc, duration = _ssh_exec(state, virsh_cmd, timeout=timeout)
+
+    # Parse the virsh output into structured data
+    disks = []
+    for line in stdout.strip().split('\n'):
+        line = line.strip()
+        if not line or line.startswith('Target') or line.startswith('---'):
+            continue
+        parts = line.split(None, 1)
+        if len(parts) == 2:
+            target, source = parts
+            disk_type = "unknown"
+            if '/hotplug-disks/' in source:
+                disk_type = "hotplug"
+            elif '/vmi-disks/' in source:
+                disk_type = "persistent"
+            elif source.startswith('/dev/'):
+                disk_type = "block"
+            elif 'cloud-init' in source or 'noCloud' in source:
+                disk_type = "cloudinit"
+            # Extract volume name from source path
+            vol_name = source.rsplit('/', 1)[-1] if '/' in source else source
+            if vol_name == 'disk.img':
+                vol_name = source.rsplit('/', 2)[-2] if source.count('/') >= 2 else vol_name
+            disks.append({
+                "target": target,
+                "source": source,
+                "type": disk_type,
+                "volume": vol_name,
             })
-            return
 
-        # Run virsh domblklist
-        virsh_cmd = f"oc exec -n {namespace} {pod_name} -- virsh domblklist 1 2>&1"
-        result = subprocess.run(
-            ['ssh'] + _ssh_opts(state) + [state["host"], virsh_cmd],
-            capture_output=True, text=True, timeout=timeout,
-        )
-        stdout = _strip_ansi(result.stdout)
-
-        # Parse the virsh output into structured data
-        disks = []
-        for line in stdout.strip().split('\n'):
-            line = line.strip()
-            if not line or line.startswith('Target') or line.startswith('---'):
-                continue
-            parts = line.split(None, 1)
-            if len(parts) == 2:
-                target, source = parts
-                disk_type = "unknown"
-                if '/hotplug-disks/' in source:
-                    disk_type = "hotplug"
-                elif '/vmi-disks/' in source:
-                    disk_type = "persistent"
-                elif source.startswith('/dev/'):
-                    disk_type = "block"
-                elif 'cloud-init' in source or 'noCloud' in source:
-                    disk_type = "cloudinit"
-                # Extract volume name from source path
-                vol_name = source.rsplit('/', 1)[-1] if '/' in source else source
-                if vol_name == 'disk.img':
-                    vol_name = source.rsplit('/', 2)[-2] if source.count('/') >= 2 else vol_name
-                disks.append({
-                    "target": target,
-                    "source": source,
-                    "type": disk_type,
-                    "volume": vol_name,
-                })
-
-        _output({
-            "success": result.returncode == 0,
-            "disks": disks,
-            "raw": stdout,
-            "duration": round(time.time() - start_time, 2),
-        })
-    except subprocess.TimeoutExpired:
-        _output({
-            "success": False,
-            "error": f"Timed out after {timeout}s",
-            "duration": timeout,
-        })
-    except Exception as e:
-        _output({
-            "success": False,
-            "error": str(e),
-            "duration": round(time.time() - start_time, 2),
-        })
+    _output({
+        "success": rc == 0,
+        "disks": disks,
+        "raw": stdout,
+        "duration": duration,
+    })
 
 
-def cmd_vm_exec(args):
+@json_safe
+@requires_connection
+def cmd_vm_exec(args, state):
     """Execute a command inside a KubeVirt VM.
 
     Tries virtctl ssh first (fast, clean output). If that fails due to
     auth issues, falls back to serial console via pexpect.
     """
-    state = _load_state()
-    if not state:
-        _output({"success": False, "error": "Not connected. Run 'connect' first."})
-        return
-
     vm_name = args.vm_name
     namespace = args.namespace
     command = args.command
@@ -729,8 +648,8 @@ def cmd_vm_exec(args):
 
     # Strategy 1: virtctl ssh (key-based auth)
     ssh_cmd = (
-        f"virtctl ssh {user}@{vm_name} -n {namespace} "
-        f"--command {_shell_quote(command)} -l {user} --known-hosts="
+        f"virtctl ssh {shlex.quote(user)}@{shlex.quote(vm_name)} -n {shlex.quote(namespace)} "
+        f"--command {shlex.quote(command)} -l {shlex.quote(user)} --known-hosts="
     )
     try:
         result = subprocess.run(
@@ -766,7 +685,7 @@ def cmd_vm_exec(args):
 
     console_cmd = (
         f"ssh -o ControlPath={state['control_path']} -o ConnectTimeout=10 "
-        f"{state['host']} virtctl console {vm_name} -n {namespace}"
+        f"{state['host']} virtctl console {shlex.quote(vm_name)} -n {shlex.quote(namespace)}"
     )
     output_buffer = []
     try:
@@ -848,63 +767,44 @@ def cmd_vm_exec(args):
         })
 
 
-def cmd_write_file(args):
+@json_safe
+@requires_connection
+def cmd_write_file(args, state):
     """Write file to remote system via base64 encoding."""
-    state = _load_state()
-    if not state:
-        _output({"success": False, "error": "Not connected. Run 'connect' first."})
-        return
-
     remote_path = args.remote_path
     content_b64 = args.content
 
-    quoted_path = _shell_quote(remote_path)
+    quoted_path = shlex.quote(remote_path)
     cmd = f"mkdir -p \"$(dirname {quoted_path})\" && base64 -d > {quoted_path}"
 
-    try:
-        result = subprocess.run(
-            ['ssh'] + _ssh_opts(state) + [state["host"], cmd],
-            input=content_b64, capture_output=True, text=True, timeout=30,
-        )
-        _output({
-            "success": result.returncode == 0,
-            "return_code": result.returncode,
-            "stderr": _strip_ansi(result.stderr),
-        })
-    except Exception as e:
-        _output({"success": False, "error": str(e)})
+    ok, stdout, stderr, rc, duration = _ssh_exec(state, cmd, timeout=30, input_data=content_b64)
+    _output({
+        "success": ok,
+        "return_code": rc,
+        "stderr": stderr,
+    })
 
 
-def cmd_read_file(args):
+@json_safe
+@requires_connection
+def cmd_read_file(args, state):
     """Read file from remote system."""
-    state = _load_state()
-    if not state:
-        _output({"success": False, "error": "Not connected. Run 'connect' first."})
-        return
-
     remote_path = args.remote_path
 
-    try:
-        result = subprocess.run(
-            ['ssh'] + _ssh_opts(state) + [state["host"], f"cat {_shell_quote(remote_path)}"],
-            capture_output=True, text=True, timeout=30,
-        )
-        _output({
-            "success": result.returncode == 0,
-            "content": result.stdout if result.returncode == 0 else None,
-            "error": _strip_ansi(result.stderr) if result.returncode != 0 else None,
-        })
-    except Exception as e:
-        _output({"success": False, "error": str(e)})
+    ok, stdout, stderr, rc, duration = _ssh_exec(
+        state, f"cat {shlex.quote(remote_path)}", timeout=30,
+    )
+    _output({
+        "success": ok,
+        "content": stdout if ok else None,
+        "error": stderr if not ok else None,
+    })
 
 
-def cmd_devcontainer_start(args):
+@json_safe
+@requires_connection
+def cmd_devcontainer_start(args, state):
     """Parse devcontainer.json and start container on workstation."""
-    state = _load_state()
-    if not state:
-        _output({"success": False, "error": "Not connected. Run 'connect' first."})
-        return
-
     project_dir = args.project_dir
     host = state["host"]
     opts = _ssh_opts(state)
@@ -922,7 +822,7 @@ def cmd_devcontainer_start(args):
         f"{project_dir}/.devcontainer/podman/devcontainer.json",
         f"{project_dir}/.devcontainer/devcontainer.json",
     ]:
-        ok, content, _ = ssh_run(f"cat {_shell_quote(dc_path)} 2>/dev/null")
+        ok, content, _ = ssh_run(f"cat {shlex.quote(dc_path)} 2>/dev/null")
         if ok and content.strip():
             try:
                 config = json.loads(content)
@@ -958,7 +858,7 @@ def cmd_devcontainer_start(args):
             pass
 
     # Stop any existing container
-    ssh_run(f"podman rm -f {container_name} 2>/dev/null", timeout=10)
+    ssh_run(f"podman rm -f {shlex.quote(container_name)} 2>/dev/null", timeout=10)
 
     # Determine SSH mount paths
     home_dir = "/home/student"
@@ -968,17 +868,19 @@ def cmd_devcontainer_start(args):
         container_ssh_dir = f"/home/{container_user or 'student'}/.ssh"
 
     # Build podman run command
+    # run_args are parsed from devcontainer.json (podman flags like --cap-add SYS_PTRACE),
+    # treated as trusted project config, not raw user input
     args_str = " ".join(run_args)
-    cmd = (f"podman run -d --name {container_name} "
+    cmd = (f"podman run -d --name {shlex.quote(container_name)} "
            f"{args_str} "
-           f"-v {project_dir}:/workspaces/{exercise_name}:Z "
+           f"-v {project_dir}:/workspaces/{shlex.quote(exercise_name)}:Z "
            f"-v {home_dir}/.ssh:{container_ssh_dir}:z "
-           f"{image} sleep infinity")
+           f"{shlex.quote(image)} sleep infinity")
 
     ok, stdout, stderr = ssh_run(cmd, timeout=120)
     if ok:
         # Verify container
-        ok2, out2, _ = ssh_run(f"podman exec {container_name} echo 'ready'", timeout=15)
+        ok2, out2, _ = ssh_run(f"podman exec {shlex.quote(container_name)} echo 'ready'", timeout=15)
         if ok2 and 'ready' in out2:
             workdir = f"/workspaces/{exercise_name}"
             # Save devcontainer state
@@ -988,7 +890,7 @@ def cmd_devcontainer_start(args):
                 "user": container_user,
                 "image": image,
             }
-            _save_state(state)
+            save_state(STATE_FILE, state)
 
             _output({
                 "success": True,
@@ -1002,80 +904,50 @@ def cmd_devcontainer_start(args):
     _output({"success": False, "error": f"Failed to start container: {stderr}"})
 
 
-def cmd_devcontainer_run(args):
+@json_safe
+@requires_connection
+def cmd_devcontainer_run(args, state):
     """Execute command in dev container."""
-    state = _load_state()
-    if not state:
-        _output({"success": False, "error": "Not connected. Run 'connect' first."})
-        return
-
     dc = state.get("devcontainer", {})
     container_name = dc.get("name", "qa-devcontainer")
     workdir = args.workdir or dc.get("workdir")
     user = args.user or dc.get("user")
 
-    workdir_flag = f"-w {workdir}" if workdir else ""
-    user_flag = f"--user {user}" if user else ""
-    escaped_cmd = _shell_quote(args.command)
+    workdir_flag = f"-w {shlex.quote(workdir)}" if workdir else ""
+    user_flag = f"--user {shlex.quote(user)}" if user else ""
+    escaped_cmd = shlex.quote(args.command)
 
-    full_cmd = f"podman exec {user_flag} {workdir_flag} {container_name} bash -c {escaped_cmd}"
+    full_cmd = f"podman exec {user_flag} {workdir_flag} {shlex.quote(container_name)} bash -c {escaped_cmd}"
 
-    start_time = time.time()
-    try:
-        result = subprocess.run(
-            ['ssh'] + _ssh_opts(state) + [state["host"], full_cmd],
-            capture_output=True, text=True, timeout=args.timeout,
-        )
-        duration = time.time() - start_time
-
-        _output({
-            "success": result.returncode == 0,
-            "return_code": result.returncode,
-            "stdout": _strip_ansi(result.stdout),
-            "stderr": _strip_ansi(result.stderr),
-            "duration": round(duration, 2),
-        })
-    except subprocess.TimeoutExpired:
-        _output({
-            "success": False,
-            "return_code": -1,
-            "stdout": "",
-            "stderr": f"Command timed out after {args.timeout}s",
-            "duration": args.timeout,
-        })
+    ok, stdout, stderr, rc, duration = _ssh_exec(state, full_cmd, timeout=args.timeout)
+    _output({
+        "success": ok,
+        "return_code": rc,
+        "stdout": stdout,
+        "stderr": stderr,
+        "duration": duration,
+    })
 
 
-def cmd_devcontainer_stop(args):
+@json_safe
+@requires_connection
+def cmd_devcontainer_stop(args, state):
     """Stop and remove dev container."""
-    state = _load_state()
-    if not state:
-        _output({"success": False, "error": "Not connected."})
-        return
-
     dc = state.get("devcontainer", {})
     container_name = dc.get("name", "qa-devcontainer")
 
-    try:
-        result = subprocess.run(
-            ['ssh'] + _ssh_opts(state) + [state["host"], f"podman rm -f {container_name} 2>/dev/null"],
-            capture_output=True, text=True, timeout=15,
-        )
-        if "devcontainer" in state:
-            del state["devcontainer"]
-            _save_state(state)
+    _ssh_exec(state, f"podman rm -f {shlex.quote(container_name)} 2>/dev/null", timeout=15)
+    if "devcontainer" in state:
+        del state["devcontainer"]
+        save_state(STATE_FILE, state)
 
-        _output({"success": True})
-    except Exception as e:
-        _output({"success": False, "error": str(e)})
+    _output({"success": True})
 
 
-def cmd_autotest(args):
+@json_safe
+@requires_connection
+def cmd_autotest(args, state):
     """Run DynoLabs 5 autotest (Rust CLI only)."""
-    state = _load_state()
-    if not state:
-        _output({"success": False, "error": "Not connected. Run 'connect' first."})
-        return
-
     framework = state.get("framework", "unknown")
     if framework != 'dynolabs5-rust':
         _output({
@@ -1089,35 +961,20 @@ def cmd_autotest(args):
         cmd += " --ignore-errors"
 
     _err(f"Running: {cmd}")
-    start_time = time.time()
-    try:
-        result = subprocess.run(
-            ['ssh'] + _ssh_opts(state) + [state["host"], cmd],
-            capture_output=True, text=True, timeout=args.timeout,
-        )
-        duration = time.time() - start_time
-        _output({
-            "success": result.returncode == 0,
-            "return_code": result.returncode,
-            "stdout": _strip_ansi(result.stdout),
-            "stderr": _strip_ansi(result.stderr),
-            "duration": round(duration, 2),
-        })
-    except subprocess.TimeoutExpired:
-        _output({
-            "success": False, "return_code": -1,
-            "stdout": "", "stderr": f"autotest timed out after {args.timeout}s",
-            "duration": args.timeout,
-        })
+    ok, stdout, stderr, rc, duration = _ssh_exec(state, cmd, timeout=args.timeout)
+    _output({
+        "success": ok,
+        "return_code": rc,
+        "stdout": stdout,
+        "stderr": stderr,
+        "duration": duration,
+    })
 
 
-def cmd_coursetest(args):
+@json_safe
+@requires_connection
+def cmd_coursetest(args, state):
     """Run DynoLabs 5 coursetest (Rust CLI only)."""
-    state = _load_state()
-    if not state:
-        _output({"success": False, "error": "Not connected. Run 'connect' first."})
-        return
-
     framework = state.get("framework", "unknown")
     if framework != 'dynolabs5-rust':
         _output({
@@ -1126,36 +983,25 @@ def cmd_coursetest(args):
         })
         return
 
-    cmd = f"lab coursetest {args.scripts_file}"
+    cmd = f"lab coursetest {shlex.quote(args.scripts_file)}"
     if args.dry_run:
         cmd += " --dry-run"
 
     _err(f"Running: {cmd}")
-    start_time = time.time()
-    try:
-        result = subprocess.run(
-            ['ssh'] + _ssh_opts(state) + [state["host"], cmd],
-            capture_output=True, text=True, timeout=args.timeout,
-        )
-        duration = time.time() - start_time
-        _output({
-            "success": result.returncode == 0,
-            "return_code": result.returncode,
-            "stdout": _strip_ansi(result.stdout),
-            "stderr": _strip_ansi(result.stderr),
-            "duration": round(duration, 2),
-        })
-    except subprocess.TimeoutExpired:
-        _output({
-            "success": False, "return_code": -1,
-            "stdout": "", "stderr": f"coursetest timed out after {args.timeout}s",
-            "duration": args.timeout,
-        })
+    ok, stdout, stderr, rc, duration = _ssh_exec(state, cmd, timeout=args.timeout)
+    _output({
+        "success": ok,
+        "return_code": rc,
+        "stdout": stdout,
+        "stderr": stderr,
+        "duration": duration,
+    })
 
 
+@json_safe
 def cmd_disconnect(args):
     """Tear down ControlMaster connection."""
-    state = _load_state()
+    state = load_state(STATE_FILE)
     if not state:
         _output({"success": True, "message": "No active connection"})
         return
@@ -1175,9 +1021,6 @@ def cmd_disconnect(args):
     try:
         if os.path.exists(control_path):
             os.unlink(control_path)
-        control_dir = state.get("control_dir", "")
-        if control_dir and os.path.exists(control_dir):
-            os.rmdir(control_dir)
     except Exception:
         pass
 

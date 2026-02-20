@@ -21,9 +21,7 @@ import sys
 from datetime import datetime
 from collections import defaultdict
 
-
-def _err(msg):
-    print(msg, file=sys.stderr)
+from eqa_common import _err, json_safe
 
 
 # Performance budget thresholds (seconds)
@@ -253,16 +251,19 @@ def generate_chapter_summary(results: list, course_code: str = "", chapter: str 
     return "\n".join(lines)
 
 
+@json_safe
 def cmd_exercise(args):
     data = json.loads(args.data)
     print(generate_exercise_report(data))
 
 
+@json_safe
 def cmd_chapter(args):
     data = json.loads(args.data)
     print(generate_chapter_summary(data, args.course, args.chapter))
 
 
+@json_safe
 def cmd_score(args):
     data = json.loads(args.data)
     result = calculate_quality_score(data)

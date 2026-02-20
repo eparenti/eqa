@@ -2,7 +2,7 @@
 """EPUB extraction, parsing, and instruction extraction.
 
 All output is JSON to stdout, diagnostics to stderr.
-Caches extraction to /tmp/eqa-epub-<md5>/ to avoid re-extracting.
+Caches extraction to ~/.cache/eqa/epub-<md5>/ to avoid re-extracting.
 
 Usage:
     python3 epub_tool.py parse <epub_path> [--lesson-path <path>]
@@ -18,9 +18,10 @@ import re
 import shutil
 import subprocess
 import sys
-import tempfile
 import zipfile
 from pathlib import Path
+
+from eqa_common import _output, _err, get_cache_dir, json_safe
 
 # Lazy-loaded at first use
 _bs4_loaded = False
@@ -37,19 +38,16 @@ def _ensure_bs4():
         _bs4_loaded = True
 
 
-def _output(data):
-    print(json.dumps(data, default=str))
-
-
-def _err(msg):
-    print(msg, file=sys.stderr)
-
-
 def _epub_cache_dir(epub_path: str) -> str:
-    """Get or create cached extraction directory for an EPUB."""
+    """Get or create cached extraction directory for an EPUB.
+
+    Cache key includes a hash of this tool's source so that parsing
+    bug fixes automatically invalidate stale caches.
+    """
     mtime = str(os.path.getmtime(epub_path))
-    md5 = hashlib.md5((epub_path + mtime).encode()).hexdigest()[:12]
-    cache_dir = f"/tmp/eqa-epub-{md5}"
+    tool_hash = hashlib.md5(Path(__file__).read_bytes()).hexdigest()[:8]
+    md5 = hashlib.md5((epub_path + mtime + tool_hash).encode()).hexdigest()[:12]
+    cache_dir = os.path.join(get_cache_dir(), f"epub-{md5}")
     if not os.path.exists(cache_dir) or not os.path.exists(os.path.join(cache_dir, "EPUB")):
         if os.path.exists(cache_dir):
             shutil.rmtree(cache_dir)
@@ -60,20 +58,24 @@ def _epub_cache_dir(epub_path: str) -> str:
     return cache_dir
 
 
-def _find_exercises(content_dir: str, lesson_path: str = None):
-    """Find all exercises in extracted EPUB content."""
+def _build_exercise_map(content_path):
+    """Parse all HTML files once. Returns {exercise_id: {section, chapter_file, type, title}}.
+
+    Consolidates the glob+parse+search loop that was previously duplicated
+    in _find_exercises(), cmd_instructions(), and cmd_summary().
+    """
     _ensure_bs4()
 
-    exercises = []
-    content_path = Path(content_dir)
+    exercise_map = {}
+    content_path = Path(content_path)
 
     for html_file in sorted(list(content_path.glob("*.xhtml")) + list(content_path.glob("*.html"))):
         try:
             with open(html_file, 'r', encoding='utf-8') as f:
                 soup = BeautifulSoup(f, 'html.parser')
 
-            for section in soup.find_all('section'):
-                classes = section.get('class', [])
+            for s in soup.find_all('section'):
+                classes = s.get('class', [])
                 if not isinstance(classes, list):
                     classes = classes.split()
                 if 'sect2' not in classes:
@@ -88,7 +90,7 @@ def _find_exercises(content_dir: str, lesson_path: str = None):
 
                 # Extract exercise ID from 'lab start <name>'
                 exercise_id = None
-                for pre in section.find_all('pre'):
+                for pre in s.find_all('pre'):
                     text = pre.get_text()
                     if 'lab start' in text:
                         match = re.search(r'lab start(?:\s+-t\s+[\w-]+)?\s+([\w-]+)', text)
@@ -100,21 +102,37 @@ def _find_exercises(content_dir: str, lesson_path: str = None):
                     continue
 
                 # Extract title
-                title_elem = section.find(['h1', 'h2', 'h3'])
+                title_elem = s.find(['h1', 'h2', 'h3'])
                 title = title_elem.text.strip() if title_elem else exercise_id
 
-                # Find solution files
-                solution_files = _find_solution_files(exercise_id, lesson_path) if lesson_path else []
-
-                exercises.append({
-                    "id": exercise_id,
+                exercise_map[exercise_id] = {
+                    "section": s,
+                    "chapter_file": html_file.name,
                     "type": ex_type,
                     "title": re.sub(r'\s+', ' ', title),
-                    "chapter_file": html_file.name,
-                    "solution_files": solution_files,
-                })
+                }
         except Exception as e:
             _err(f"Warning: Error parsing {html_file.name}: {e}")
+
+    return exercise_map
+
+
+def _find_exercises(content_dir: str, lesson_path: str = None):
+    """Find all exercises in extracted EPUB content."""
+    exercise_map = _build_exercise_map(content_dir)
+
+    exercises = []
+    for exercise_id, info in exercise_map.items():
+        # Find solution files
+        solution_files = _find_solution_files(exercise_id, lesson_path) if lesson_path else []
+
+        exercises.append({
+            "id": exercise_id,
+            "type": info["type"],
+            "title": info["title"],
+            "chapter_file": info["chapter_file"],
+            "solution_files": solution_files,
+        })
 
     return exercises
 
@@ -144,6 +162,7 @@ def _find_solution_files(exercise_id: str, lesson_path: str) -> list:
     return sorted(set(solution_files))
 
 
+@json_safe
 def cmd_parse(args):
     """Parse EPUB and return course structure."""
     _ensure_bs4()
@@ -192,6 +211,7 @@ def cmd_parse(args):
     })
 
 
+@json_safe
 def cmd_instructions(args):
     """Extract step-by-step instructions for a specific exercise."""
     _ensure_bs4()
@@ -202,46 +222,18 @@ def cmd_instructions(args):
         return
 
     cache_dir = _epub_cache_dir(epub_path)
-    content_dir = Path(cache_dir) / "EPUB"
+    content_dir = os.path.join(cache_dir, "EPUB")
     exercise_id = args.exercise_id
 
-    # Find exercise section
-    section = None
-    for html_file in sorted(list(content_dir.glob("*.xhtml")) + list(content_dir.glob("*.html"))):
-        try:
-            with open(html_file, 'r', encoding='utf-8') as f:
-                soup = BeautifulSoup(f, 'html.parser')
+    exercise_map = _build_exercise_map(content_dir)
+    info = exercise_map.get(exercise_id)
 
-            for s in soup.find_all('section'):
-                classes = s.get('class', [])
-                if not isinstance(classes, list):
-                    classes = classes.split()
-                if 'sect2' not in classes:
-                    continue
-                if 'ge' not in classes and 'lab' not in classes:
-                    continue
-
-                for pre in s.find_all('pre'):
-                    text = pre.get_text()
-                    if re.search(
-                        rf'lab start(?:\s+-t\s+[\w-]+)?\s+{re.escape(exercise_id)}\b',
-                        text,
-                    ):
-                        section = s
-                        break
-                if section:
-                    break
-        except Exception:
-            continue
-        if section:
-            break
-
-    if not section:
+    if not info:
         _output({"success": False, "error": f"Exercise {exercise_id} not found in EPUB"})
         return
 
     # Parse the exercise content
-    result = _parse_exercise(exercise_id, section)
+    result = _parse_exercise(exercise_id, info["section"])
     _output(result)
 
 
@@ -433,6 +425,7 @@ def _is_file_content_block(pre) -> bool:
 
 def _extract_filename(element, step_element) -> str:
     """Extract target filename from prose context near a file content block."""
+    _ensure_bs4()
     has_content_keyword = False
     found_filename = None
 
@@ -509,8 +502,6 @@ def _extract_filename(element, step_element) -> str:
                 return fn
 
     # Strategy 3: Check following siblings of the element.
-    # Pattern: step says "add the following content" (file block here),
-    # next step says "Save the file as X.yml" (filename there).
     for sibling in element.next_siblings:
         if not isinstance(sibling, Tag):
             continue
@@ -523,8 +514,6 @@ def _extract_filename(element, step_element) -> str:
                 return fn
 
     # Strategy 4: Check ancestor steps for the filename.
-    # Pattern: parent step says "Create a playbook named X.yml",
-    # sub-step has the content block.
     node = step_element.parent
     while node:
         if node.name == 'li':
@@ -670,7 +659,6 @@ def _parse_code_block(pre) -> list:
                 prompt_responses.add(match.group(1))
 
     # Detect ansible-vault password prompts
-    # Pattern: "New vault password (id): PASSWORD" or "Confirm new vault password (id): PASSWORD"
     vault_prompt_pattern = r'(?:New vault password|Confirm new vault password|Vault password)\s*(?:\([^)]+\))?:\s*(\S+)'
     vault_matches = re.findall(vault_prompt_pattern, parent_text)
     if vault_matches:
@@ -704,6 +692,7 @@ def _parse_code_block(pre) -> list:
     return commands
 
 
+@json_safe
 def cmd_summary(args):
     """Summarize exercise testability — which steps have commands vs GUI-only."""
     _ensure_bs4()
@@ -717,39 +706,12 @@ def cmd_summary(args):
     content_dir = os.path.join(cache_dir, "EPUB")
     lesson_path = args.lesson_path or str(Path(epub_path).parent)
 
-    exercises = _find_exercises(content_dir, lesson_path)
+    exercise_map = _build_exercise_map(content_dir)
     summaries = []
 
-    for ex in exercises:
-        exercise_id = ex["id"]
-
-        # Find exercise section
-        section = None
-        content_path = Path(content_dir)
-        for html_file in sorted(list(content_path.glob("*.xhtml")) + list(content_path.glob("*.html"))):
-            try:
-                with open(html_file, 'r', encoding='utf-8') as f:
-                    soup = BeautifulSoup(f, 'html.parser')
-                for s in soup.find_all('section'):
-                    classes = s.get('class', [])
-                    if not isinstance(classes, list):
-                        classes = classes.split()
-                    if 'sect2' not in classes:
-                        continue
-                    for pre in s.find_all('pre'):
-                        if re.search(rf'lab start(?:\s+-t\s+[\w-]+)?\s+{re.escape(exercise_id)}\b', pre.get_text()):
-                            section = s
-                            break
-                    if section:
-                        break
-            except Exception:
-                continue
-            if section:
-                break
-
-        if not section:
-            summaries.append({"id": exercise_id, "type": ex["type"], "error": "not found in EPUB"})
-            continue
+    for exercise_id, info in exercise_map.items():
+        section = info["section"]
+        solution_files = _find_solution_files(exercise_id, lesson_path) if lesson_path else []
 
         parsed = _parse_exercise(exercise_id, section)
 
@@ -788,7 +750,7 @@ def cmd_summary(args):
         stats = classify_steps(parsed.get("steps", []))
         summaries.append({
             "id": exercise_id,
-            "type": ex["type"],
+            "type": info["type"],
             "title": parsed.get("title", ""),
             "steps": stats["total"],
             "gui_only_steps": stats["gui_only"],
@@ -796,13 +758,14 @@ def cmd_summary(args):
             "file_steps": stats["with_files"],
             "total_commands": stats["total_commands"],
             "total_files": stats["total_files"],
-            "has_solutions": len(ex.get("solution_files", [])) > 0,
+            "has_solutions": len(solution_files) > 0,
             "testable": stats["with_commands"] > 0 or stats["with_files"] > 0,
         })
 
     _output({"success": True, "exercises": summaries})
 
 
+@json_safe
 def cmd_build(args):
     """Build EPUB via sk."""
     course_path = Path(args.course_path).expanduser().resolve()
