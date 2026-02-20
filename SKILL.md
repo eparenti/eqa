@@ -435,10 +435,11 @@ For exercises that deploy web applications or use web consoles (OpenShift, AAP C
 
 | Severity | Description | Examples | Action |
 |----------|-------------|----------|--------|
-| **P0** | Exercise unusable | `lab start` crashes, SSH fails, missing lab command | STOP testing, report immediately |
+| **P0** | Exercise unusable | `lab start` script logic error, missing playbooks, wrong targets | STOP testing, report immediately |
 | **P1** | Validation broken | Grading false positive/negative, cleanup incomplete, solution files don't work, verification fails after correct steps | MUST FIX before release |
 | **P2** | Quality issue | Instruction step fails, unclear error messages, missing files, security anti-patterns | SHOULD FIX |
 | **P3** | Polish | Typos in output, minor style issues, naming inconsistencies | Optional fix |
+| **ENV** | Environment issue | Library version mismatch, wrong workstation image, cluster not ready, disk full | Not an exercise bug — document and skip |
 
 **Severity Decision Tree:**
 1. Can the student complete the exercise? NO → **P0**
@@ -663,6 +664,32 @@ Key points:
 - Use `web_tool.py login <console-url> --username admin --password redhatocp --then <target-url>` for web console
 - Always append `-m stdout` to `ansible-navigator` commands
 - For dev containers: `devcontainer-start` → `devcontainer-run` → let `lab finish` handle cleanup
+
+## Environment Issues vs Exercise Bugs
+
+Not every failure is an exercise bug. Distinguish carefully:
+
+**Environment issues** (report as ENV, not P0-P3):
+- Python library version mismatches in the grading package (e.g., `ResourceList.__init__() got an unexpected keyword argument`)
+- Workstation provisioned for a different course (wrong `RHT_COURSE`)
+- OCP cluster not ready, operators degraded, or nodes not available
+- Disk full, network unreachable, DNS resolution failures
+- Package version on PyPI doesn't match the EPUB being tested
+
+**Exercise bugs** (report as P0-P3):
+- `lab start` script has wrong host targets, missing playbooks, or logic errors
+- Grading checks wrong resources, false positives/negatives
+- EPUB instructions don't match what the lab scripts set up
+- Solution files don't produce the expected state
+- Cleanup incomplete (artifacts left behind)
+
+**How to tell the difference:**
+1. If the same exercise works on a freshly provisioned classroom workstation but fails on your test workstation → environment issue
+2. If `lab start` fails but `oc`/`virtctl` commands work fine for the same resources → grading script issue, not cluster issue
+3. If ALL exercises fail at the same step (e.g., CatalogSource check) → likely environment, not exercise-specific
+4. If ONE exercise fails at a unique step → likely an exercise bug
+
+When blocked by an environment issue, report it as ENV in the summary and note that the exercises could not be validated. Do NOT classify environment issues as P0 exercise bugs.
 
 ## Decision Points
 
