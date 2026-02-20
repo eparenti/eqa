@@ -39,6 +39,17 @@ Fully automated quality assurance for ANY Red Hat Training course. Works with an
 
 **Zero manual configuration required.**
 
+## Critical Rules
+
+These six rules prevent the most common time-wasting mistakes. Internalize them before testing.
+
+1. **Paths must be absolute** — `devcontainer-start` does not expand `~`. Always use `/home/student/<exercise>`.
+2. **write-file requires base64** — Encode content with `base64 -w0 /tmp/file.yml`, then pass via `--content`. Write locally first, encode, then upload.
+3. **devops user for sudo** — `student` requires a password and will hang. `devops` has NOPASSWD sudo. Use `ssh devops@<host> 'sudo <cmd>'` for privileged operations on managed hosts.
+4. **Dev container podman variant** — The tool checks `.devcontainer/podman/devcontainer.json` first (uses local registry, works). The default `devcontainer.json` may reference `registry.redhat.io` (fails without auth).
+5. **ansible-navigator: always `-m stdout`** — Without it the interactive TUI hangs. Every `ansible-navigator run` command must include `-m stdout`.
+6. **epub_tool commands are dicts** — Parsed commands from instructions JSON are `{"text": "...", ...}` dicts. Access with `.get("text")`, not string slicing. File actions are nested in `sub_steps[].file_actions[]`.
+
 ## Setup Workflow
 
 When invoked, follow these steps in order:
@@ -65,7 +76,7 @@ Returns `{course_code, course_title, exercises: [{id, type, title, solution_file
 python3 ~/git-repos/eqa/.skilldata/scripts/ssh_tool.py connect --host workstation
 ```
 
-Establishes ControlMaster connection, detects lab framework. State persists in `/tmp/eqa-ssh-state.json`.
+Establishes ControlMaster connection, detects lab framework. State persists in `~/.cache/eqa/ssh-state.json`.
 
 ### 4. Build Course Profile
 
@@ -186,6 +197,8 @@ This step is **optional** — only needed for TC-WEB testing with Playwright or 
 
 Run Pass 1 first. If it passes, run Pass 2 for thorough validation. If Pass 1 fails, document the bugs and skip Pass 2.
 
+Use the **Recipes** section below to execute each step efficiently — the recipes eliminate the common trial-and-error that slows testing down.
+
 ### Batch Chapter Testing
 
 When testing all exercises in a chapter:
@@ -231,18 +244,216 @@ Calculated automatically by `report_tool.py score`:
 | 50-69 | Needs work — multiple issues |
 | <50 | Not ready |
 
+## Recipes
+
+Copy-paste patterns for the most common operations. Use these during student simulation and QA validation to avoid trial-and-error.
+
+### Recipe: Dev Container Lifecycle
+
+Dev container exercises require specific ordering. All paths must be absolute.
+
+```bash
+# 1. Start the dev container (ABSOLUTE path — ~ does not expand)
+ssh_tool.py devcontainer-start /home/student/<exercise>
+
+# 2. Read ansible-navigator.yml for the EE image name
+ssh_tool.py devcontainer-run "cat /home/student/<exercise>/ansible-navigator.yml"
+
+# 3. Pre-pull the EE image inside the container (use --tls-verify=false for local registry)
+ssh_tool.py devcontainer-run "podman pull --tls-verify=false utility.lab.example.com:5000/<ee-image>:<tag>"
+
+# 4. Run exercise commands inside the container
+ssh_tool.py devcontainer-run "cd /home/student/<exercise> && ansible-navigator run playbook.yml -m stdout"
+
+# 5. lab commands run on workstation, NOT in the container
+ssh_tool.py lab grade <exercise>
+
+# 6. Let lab finish handle container cleanup — do NOT run devcontainer-stop before lab finish
+ssh_tool.py lab finish <exercise>
+```
+
+Notes:
+- The `.devcontainer/podman/devcontainer.json` variant uses the local registry and works without auth. The tool checks for it automatically.
+- Files written to the project directory on the workstation appear inside the container automatically (bind mount).
+- If the EE pull fails with "no space left on device", run `ssh_tool.py run "podman system prune -af"` on workstation first.
+
+### Recipe: Writing Files
+
+The `write-file` command requires base64-encoded content. Batch multiple files for efficiency.
+
+```bash
+# 1. Write file content locally using the Write tool
+# (Write tool) → /tmp/playbook.yml
+
+# 2. Encode to base64
+base64 -w0 /tmp/playbook.yml
+# Capture the output as $encoded
+
+# 3. Upload to workstation
+ssh_tool.py write-file /home/student/<exercise>/playbook.yml --content "$encoded"
+
+# Batch pattern: write all files locally first, then upload all at once
+ssh_tool.py write-file /home/student/<exercise>/file1.yml --content "$(base64 -w0 /tmp/file1.yml)" && \
+ssh_tool.py write-file /home/student/<exercise>/file2.yml --content "$(base64 -w0 /tmp/file2.yml)"
+```
+
+### Recipe: Applying Solution Files
+
+For TC-SOL testing (Pass 2). Start from a clean state.
+
+```bash
+# 1. List available solution files
+ssh_tool.py run "ls /home/student/<exercise>/solutions/"
+
+# 2. Copy each .sol file to its target location (strip the .sol suffix)
+ssh_tool.py run "cp /home/student/<exercise>/solutions/playbook.yml.sol /home/student/<exercise>/playbook.yml"
+
+# 3. For dev container exercises: copy into the project dir on workstation —
+#    files appear in container automatically via bind mount
+
+# 4. Run playbooks from solutions (check EPUB instructions for the exact commands)
+ssh_tool.py run "cd /home/student/<exercise> && ansible-navigator run playbook.yml -m stdout"
+# or inside dev container:
+ssh_tool.py devcontainer-run "cd /home/student/<exercise> && ansible-navigator run playbook.yml -m stdout"
+```
+
+### Recipe: Managed Host Commands
+
+```bash
+# Privileged operations — use devops (has NOPASSWD sudo)
+ssh_tool.py run "ssh devops@servera 'sudo systemctl restart httpd'"
+ssh_tool.py run "ssh devops@serverb 'sudo cat /etc/shadow'"
+
+# Unprivileged operations — student is fine
+ssh_tool.py run "ssh student@servera 'cat /etc/motd'"
+
+# NEVER do this — hangs waiting for password:
+# ssh_tool.py run "ssh student@servera 'sudo systemctl restart httpd'"
+```
+
+### Recipe: Parsing Instructions JSON
+
+The `epub_tool.py instructions` output has a specific structure. Here's how to navigate it:
+
+```python
+# Structure overview:
+# instructions = {
+#   "steps": [
+#     {
+#       "title": "Step title",
+#       "sub_steps": [
+#         {
+#           "text": "Instruction text",
+#           "commands": [
+#             {"text": "ansible-navigator run ...", "host": "workstation", ...}  # dicts, NOT strings
+#           ],
+#           "file_actions": [
+#             {"path": "playbook.yml", "content": "---\n...", "action": "create"}
+#           ],
+#           "is_verification": false
+#         }
+#       ]
+#     }
+#   ]
+# }
+
+# Extracting commands — they are dicts, use .get("text")
+for step in instructions["steps"]:
+    for sub in step["sub_steps"]:
+        for cmd in sub.get("commands", []):
+            command_text = cmd.get("text")  # NOT cmd[:50] or str(cmd)
+
+# Extracting file content for write-file
+for step in instructions["steps"]:
+    for sub in step["sub_steps"]:
+        for fa in sub.get("file_actions", []):
+            path = fa["path"]
+            content = fa["content"]
+
+# Finding verification steps (for GEs)
+verification_steps = [
+    sub for step in instructions["steps"]
+    for sub in step["sub_steps"]
+    if sub.get("is_verification")
+]
+```
+
+### Recipe: Grade Validation (Labs)
+
+A single `lab start` covers both the without-solution and with-solution grade checks — no restart needed between them.
+
+```bash
+# 1. Start fresh
+ssh_tool.py lab start <exercise>
+
+# 2. Grade WITHOUT solution (expect all FAIL — validates grading isn't trivially passing)
+ssh_tool.py lab grade <exercise>
+# If all checks PASS here → P1 FALSE POSITIVE bug
+
+# 3. Apply solution files (see Recipe: Applying Solution Files)
+
+# 4. Grade WITH solution (expect all PASS)
+ssh_tool.py lab grade <exercise>
+# If any check FAILS here → P1 FALSE NEGATIVE bug
+
+# 5. Clean up
+ssh_tool.py lab finish <exercise>
+```
+
+### Recipe: Verification (GEs)
+
+```bash
+# 1. After completing student simulation, find verification steps
+# Look for sub_steps with is_verification: true in the instructions JSON
+
+# 2. Run verification commands — common patterns:
+ssh_tool.py run "ssh devops@servera 'cat /etc/motd'"
+ssh_tool.py run "ssh devops@serverb 'sudo systemctl status httpd'"
+ssh_tool.py run "curl -s http://servera.lab.example.com/"
+
+# 3. Compare output with what the EPUB describes as expected
+# If verification fails after correct steps → P1 bug
+```
+
+### Recipe: ansible-vault Non-Interactive
+
+Interactive vault prompts hang in automation. Rewrite to non-interactive form:
+
+```bash
+# Write the vault password to a temp file first
+ssh_tool.py write-file /tmp/vault-pass --content "$(echo -n 'redhat' | base64 -w0)"
+
+# Encrypt a file
+ssh_tool.py run "ansible-vault encrypt --vault-password-file /tmp/vault-pass playbook.yml"
+
+# Encrypt with vault-id
+ssh_tool.py run "ansible-vault encrypt --vault-id myvault@/tmp/vault-pass secrets.yml"
+
+# Run playbook with vault
+ssh_tool.py run "ansible-navigator run site.yml -m stdout --vault-password-file /tmp/vault-pass"
+# or: --extra-vars @vault.yml --vault-password-file /tmp/vault-pass
+
+# ansible-vault create → create empty file + encrypt
+ssh_tool.py write-file /home/student/<exercise>/secrets.yml --content "$(echo -n '---\nmy_secret: value' | base64 -w0)"
+ssh_tool.py run "ansible-vault encrypt --vault-password-file /tmp/vault-pass /home/student/<exercise>/secrets.yml"
+```
+
 ## Test Categories
 
-Execute these for each exercise. Collect ALL bugs before reporting (error summary pattern — don't fail-fast). The order below is the recommended sequence, but use judgment to skip or adapt based on context.
+Execute these for each exercise. Collect ALL bugs before reporting (error summary pattern — don't fail-fast). Categories are organized into two tiers.
 
-### TC-PREREQ: Prerequisites
+### Tier 1 — Always Run
+
+These categories form the core testing flow and must be run for every exercise.
+
+#### TC-PREREQ: Prerequisites
 
 1. Run `ssh_tool.py lab start <exercise>`
 2. If start fails due to blocking lab, ssh_tool handles it automatically (finishes blocking lab, retries)
 3. If start has FAIL in output, report as P0 bug
 4. Verify SSH connectivity to all managed hosts the exercise uses (check the course profile's `real_hosts`)
 
-### TC-EXEC: Command Pre-flight Validation
+#### TC-EXEC: Command Pre-flight Validation
 
 Before running commands on live systems, validate them:
 
@@ -254,7 +465,9 @@ Before running commands on live systems, validate them:
    - **Consistency** — filenames in commands match filenames in prose/file_actions
 3. Report issues as P2 (syntax) or P3 (style) bugs WITHOUT executing them
 
-### TC-STUDENTSIM: Student Simulation
+#### TC-STUDENTSIM: Student Simulation
+
+**This is the core test.** Execute the exercise as a student would, step by step.
 
 **Read the whole exercise first.** Before executing anything, get the full instructions with `epub_tool.py instructions` and read through all steps. Understand what files need to be created, what config needs to be edited, and what the exercise is trying to teach. This context is critical for making decisions during execution.
 
@@ -262,19 +475,19 @@ Then execute step by step:
 
 1. For each step, translate the instruction into tool calls:
    - Commands in `<pre>` blocks → `ssh_tool.py run` or `devcontainer-run`
-   - File creation instructions (prose like "Create a file X containing Y") → `ssh_tool.py write-file`
+   - File creation instructions (prose like "Create a file X containing Y") → `ssh_tool.py write-file` (see **Recipe: Writing Files**)
    - File content from EPUB `file_actions` → `ssh_tool.py write-file`
    - Config file edits (prose like "Add this line to ansible.cfg") → read the file, modify it, write it back
-   - Interactive commands (vault prompts, passwords) → rewrite to non-interactive form or use `ssh_tool.py interactive`
+   - Interactive commands (vault prompts, passwords) → rewrite to non-interactive form (see **Recipe: ansible-vault Non-Interactive**)
    - Verification steps → execute and interpret output
 2. Track which steps pass/fail and why
 3. Track execution time per step for performance metrics
 
 **ansible-navigator: always add `-m stdout`** to prevent the interactive TUI from hanging.
 
-**Dev container exercises:** If the course profile shows `uses_dev_containers`:
-1. After `lab start`, use `ssh_tool.py devcontainer-start <project_dir>`
-2. Pre-pull the EE image: read `ansible-navigator.yml` for the image name, then `podman pull` it inside the container
+**Dev container exercises:** If the course profile shows `uses_dev_containers`, follow the **Recipe: Dev Container Lifecycle** above. Key points:
+1. After `lab start`, use `ssh_tool.py devcontainer-start /home/student/<exercise>` (absolute path)
+2. Pre-pull the EE image inside the container (see recipe)
 3. Run exercise commands via `ssh_tool.py devcontainer-run`
 4. `lab` commands still run on workstation (not in container)
 5. Let `lab finish` handle container cleanup (do NOT run `devcontainer-stop` before `lab finish`)
@@ -284,7 +497,7 @@ Then execute step by step:
 | GUI Step | Programmatic Equivalent |
 |----------|------------------------|
 | "Open folder in VS Code" | No-op (project dir already exists) |
-| "Reopen in Container" | `ssh_tool.py devcontainer-start <project_dir>` |
+| "Reopen in Container" | `ssh_tool.py devcontainer-start /home/student/<exercise>` |
 | "Create new file / save as X" | `ssh_tool.py write-file` with content from step context |
 | "Edit file / add content" | Read file, modify, write back via `ssh_tool.py` |
 | "Run in terminal" | `ssh_tool.py devcontainer-run <command>` |
@@ -301,11 +514,7 @@ Then execute step by step:
 | OCP web console: Create project | `oc new-project <name>` |
 | OCP web console: Check resource status | `oc get <resource> -n <project>` |
 
-**ansible-vault commands:** Rewrite interactive vault commands to non-interactive form:
-- `ansible-vault encrypt file` → `ansible-vault encrypt --vault-password-file /tmp/pass file` (write password to temp file first)
-- `ansible-vault encrypt --vault-id name@prompt file` → `ansible-vault encrypt --vault-id name@/tmp/pass file`
-- `--ask-vault-pass` → `--vault-password-file /tmp/pass`
-- `ansible-vault create` → create empty file + `ansible-vault encrypt`
+**ansible-vault commands:** See **Recipe: ansible-vault Non-Interactive**.
 
 **Network device commands:** For courses with Cisco, Juniper, or Arista devices, use 2x timeout multipliers. Network device SSH sessions are slower and may need `pexpect` for interactive prompts.
 
@@ -315,18 +524,36 @@ Then execute step by step:
 - EE image pull with "no space left on device" is an environment issue
 - `ansible-navigator` returning non-zero with `PLAY RECAP` means the playbook ran but had Ansible errors — read the output to determine if it's an exercise bug or expected behavior
 
-### TC-VERIFY: Verification (GEs)
+#### TC-VERIFY: Verification (GEs)
 
-For Guided Exercises, after completing the student simulation:
+For Guided Exercises, after completing the student simulation (see **Recipe: Verification (GEs)**):
 
 1. Re-run any steps marked `is_verification: true` in the instructions
 2. Check that verification commands produce the expected output (compare with what the EPUB describes)
 3. If a verification step fails after successfully completing all prior steps, it's a **P1 bug** — the instructions don't produce the outcome they claim
 4. Common verification patterns: `curl`, `ssh host 'command'`, `ansible-navigator inventory --list`, `systemctl status`
 
-### TC-SOL: Solution Files
+#### TC-CLEAN: Cleanup
 
-Tested SEPARATELY from student simulation — fresh start, apply solutions, verify.
+1. Run `ssh_tool.py lab finish <exercise>`
+2. If finish has FAIL in output: **P1 cleanup bug**
+3. Verify cleanup completeness: run `ssh_tool.py lab start <exercise>` again
+4. If start fails after finish: **P1 incomplete cleanup**
+5. Check that cleanup removes ALL artifacts:
+   - Users, groups, files, directories created during the exercise
+   - Services started/enabled
+   - Configuration changes
+   - Firewall rules
+   - Containers, images
+6. Run `ssh_tool.py lab finish <exercise>` to clean up after verification
+
+### Tier 2 — On Request
+
+Run these when explicitly requested, when investigating specific issues, or during thorough QA passes.
+
+#### TC-SOL: Solution Files
+
+Tested SEPARATELY from student simulation — fresh start, apply solutions, verify. See **Recipe: Applying Solution Files** and **Recipe: Grade Validation (Labs)**.
 
 1. Run `ssh_tool.py lab start <exercise>` (fresh start, clean state)
 2. Copy each solution file to its correct location on workstation
@@ -336,7 +563,7 @@ Tested SEPARATELY from student simulation — fresh start, apply solutions, veri
 6. If solution files don't produce the expected state: **P1 bug**
 7. Run `ssh_tool.py lab finish <exercise>` to clean up
 
-### TC-SOLVE: Solve Scripts (if available)
+#### TC-SOLVE: Solve Scripts (if available)
 
 Some exercises have a `lab solve <exercise>` command that applies solutions automatically.
 
@@ -347,7 +574,7 @@ Some exercises have a `lab solve <exercise>` command that applies solutions auto
 5. If solve doesn't produce a gradeable/verifiable state: **P1 bug**
 6. Run `ssh_tool.py lab finish <exercise>` to clean up
 
-### TC-GRADE: Grading (Labs Only)
+#### TC-GRADE: Grading (Labs Only)
 
 **Critical: DynoLabs grading exit codes do NOT indicate pass/fail of checks.** See `.skilldata/docs/dynolabs-grading.md`.
 
@@ -372,7 +599,7 @@ Some exercises have a `lab solve <exercise>` command that applies solutions auto
 
 4. **Grade message quality**: Check that error messages are clear and actionable, not raw Python tracebacks or cryptic codes. Unclear messages are P2 bugs.
 
-### TC-CONTRACT: Contract Validation
+#### TC-CONTRACT: Contract Validation
 
 Verify alignment between EPUB instructions, solution files, and grading scripts:
 
@@ -381,21 +608,7 @@ Verify alignment between EPUB instructions, solution files, and grading scripts:
 3. **EPUB → Grading**: Every outcome the EPUB claims should be validated by grading (for Labs). If the EPUB describes an outcome that grading doesn't check: **P2 bug**
 4. **Naming consistency**: Exercise IDs, file paths, and variable names should be consistent across EPUB, solutions, and grading. Mismatches: **P3 bug**
 
-### TC-CLEAN: Cleanup
-
-1. Run `ssh_tool.py lab finish <exercise>`
-2. If finish has FAIL in output: **P1 cleanup bug**
-3. Verify cleanup completeness: run `ssh_tool.py lab start <exercise>` again
-4. If start fails after finish: **P1 incomplete cleanup**
-5. Check that cleanup removes ALL artifacts:
-   - Users, groups, files, directories created during the exercise
-   - Services started/enabled
-   - Configuration changes
-   - Firewall rules
-   - Containers, images
-6. Run `ssh_tool.py lab finish <exercise>` to clean up after verification
-
-### TC-IDEM: Idempotency
+#### TC-IDEM: Idempotency
 
 Run the full cycle (start → simulate → grade → finish) at least twice. Compare results.
 
@@ -408,7 +621,7 @@ Run the full cycle (start → simulate → grade → finish) at least twice. Com
    - Conditional artifacts (created based on conditions, cleanup unconditional)
    - Forgotten dependencies (groups, files, services not cleaned)
 
-### TC-E2E: Exercise Independence
+#### TC-E2E: Exercise Independence
 
 Validate that exercises don't depend on state from previous exercises.
 
@@ -416,7 +629,7 @@ Validate that exercises don't depend on state from previous exercises.
 2. If exercise B fails because it assumes state from exercise A: **P1 independence bug**
 3. Exception: progressive exercises (check course profile for `progressive_exercises: true`) are allowed to depend on prior exercises, but must declare their dependencies
 
-### TC-INSTRUCT: Instruction Quality
+#### TC-INSTRUCT: Instruction Quality
 
 Analyze the quality of EPUB instructions:
 
@@ -426,7 +639,7 @@ Analyze the quality of EPUB instructions:
 4. **Ordering**: Steps should be in a logical order. If step N references something created in step N+2: **P2 bug**
 5. **Consistency**: File names, variable names, and host names should be consistent throughout the exercise: **P3 bug**
 
-### TC-SECURITY: Security Review
+#### TC-SECURITY: Security Review
 
 Check for security anti-patterns in exercise content:
 
@@ -438,7 +651,7 @@ Check for security anti-patterns in exercise content:
 
 Note: Many exercises intentionally use simple credentials for teaching purposes. Only flag security issues that teach bad habits students might carry to production.
 
-### TC-WEB: Web Application and Web Console Testing
+#### TC-WEB: Web Application and Web Console Testing
 
 For exercises that deploy web applications or use web consoles (OpenShift, AAP Controller, Satellite):
 
@@ -558,6 +771,8 @@ When testing multiple exercises (chapter or course), also generate a **summary r
 
 ### Report Structure
 
+Only include TC sections that were actually run. Omit sections that weren't executed.
+
 ```markdown
 # Exercise QA Report: <exercise-id>
 
@@ -594,17 +809,17 @@ When testing multiple exercises (chapter or course), also generate a **summary r
 ### TC-VERIFY (GE only)
 - Verification steps: passed/failed
 
-### TC-SOL
+### TC-SOL (if run)
 - Solution files applied: N/M
 - Playbooks executed: [list]
 - Result: PASS/FAIL
 
-### TC-GRADE (Lab only)
+### TC-GRADE (Lab only, if run)
 - Without solution: <expected FAIL, got ...>
 - With solution: <expected PASS, got ...>
 - Message quality: Good | Needs improvement
 
-### TC-CONTRACT
+### TC-CONTRACT (if run)
 - EPUB ↔ Solutions alignment: PASS/FAIL
 - Solutions ↔ Grading alignment: PASS/FAIL
 
@@ -616,10 +831,10 @@ When testing multiple exercises (chapter or course), also generate a **summary r
 - Cycle 1: PASS/FAIL
 - Cycle 2: PASS/FAIL
 
-### TC-INSTRUCT
+### TC-INSTRUCT (if run)
 - Instruction quality issues: [list]
 
-### TC-SECURITY
+### TC-SECURITY (if run)
 - Security findings: [list]
 
 ## Bugs Found
@@ -762,7 +977,7 @@ When blocked by an environment issue, report it as ENV in the summary and note t
 - **Grade passes without solution**: This is a P1 bug, not a false alarm. DynoLabs grading SHOULD fail when student hasn't done the work
 - **All steps pass but grade fails**: Check if solution files need to be applied differently, or if grading checks something the instructions don't cover
 - **EE image pull fails "no space left on device"**: Environment issue. Run `podman system prune -af` and `rm -rf ~/.cache/uv` on workstation
-- **Exercise has GUI steps**: Translate to programmatic equivalents (see GUI translation table above)
+- **Exercise has GUI steps**: Translate to programmatic equivalents (see GUI translation table in TC-STUDENTSIM)
 - **ansible-navigator hangs**: Missing `-m stdout` flag. Always append it for non-interactive execution
 - **AAP Controller web UI steps**: Use `rht-labs-aapcli` or Controller REST API via `web_tool.py api-get/api-post`
 - **Switching lessons in multi-repo course**: Must run `lab install <new-lesson>` (or `lab force <new-lesson>`) before testing exercises in a different lesson
