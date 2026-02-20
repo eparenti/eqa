@@ -47,7 +47,8 @@ def _err(msg):
 
 def _epub_cache_dir(epub_path: str) -> str:
     """Get or create cached extraction directory for an EPUB."""
-    md5 = hashlib.md5(epub_path.encode()).hexdigest()[:12]
+    mtime = str(os.path.getmtime(epub_path))
+    md5 = hashlib.md5((epub_path + mtime).encode()).hexdigest()[:12]
     cache_dir = f"/tmp/eqa-epub-{md5}"
     if not os.path.exists(cache_dir) or not os.path.exists(os.path.join(cache_dir, "EPUB")):
         if os.path.exists(cache_dir):
@@ -589,11 +590,21 @@ def _parse_code_block(pre) -> list:
 
         # Skip prompts, passwords, non-commands
         skip_patterns = [
-            'redhat', 'admin', 'student', 'yes', 'no', 'y', 'n',
+            'redhat', 'admin', 'student',
             'Student@123', 'password', 'Password',
         ]
         if cmd_text in skip_patterns:
             continue
+        # Skip y/n/yes/no only when they follow a prompt pattern (not standalone commands)
+        if cmd_text.lower() in ('y', 'n', 'yes', 'no'):
+            block_text = pre.get_text()
+            # Check if this appears after a prompt like "? (y/n)" or "(yes/no)"
+            prompt_context = re.search(
+                r'(\?\s*\((?:y/?n|yes/?no)\)|[Cc]ontinue\?|[Pp]roceed\?|[Cc]onfirm|Password:)',
+                block_text,
+            )
+            if prompt_context:
+                continue
         if cmd_text.startswith('- ') or cmd_text.startswith('key:') or cmd_text.startswith('value:'):
             continue
         # Skip config file directives (key = value patterns from ansible.cfg etc.)

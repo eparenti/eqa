@@ -30,7 +30,7 @@ This is a Claude Code skill. Invoke it with:
 - Claude Code CLI
 - Python 3.8+ with `beautifulsoup4`, `lxml`, `pyyaml`
 - SSH access to Red Hat Training workstation (`~/.ssh/config` with `workstation` host)
-- `pexpect` for interactive commands (optional)
+- `pexpect` for interactive commands
 
 ## Architecture
 

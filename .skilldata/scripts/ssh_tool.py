@@ -371,9 +371,12 @@ def cmd_run(args):
     # Check for stale socket
     if not _check_connection(state):
         _err("ControlMaster socket is stale, reconnecting...")
+        # Save old paths for cleanup
+        old_control_path = state.get("control_path", "")
+        old_control_dir = state.get("control_dir", "")
         # Attempt reconnect
         host = state["host"]
-        control_dir = state.get("control_dir", tempfile.mkdtemp(prefix="eqa-ssh-"))
+        control_dir = tempfile.mkdtemp(prefix="eqa-ssh-")
         control_path = os.path.join(control_dir, f"{host}.sock")
         try:
             cmd = [
@@ -391,6 +394,17 @@ def cmd_run(args):
                 state["control_dir"] = control_dir
                 _save_state(state)
                 _err("Reconnected successfully")
+                # Clean up old socket and directory
+                if old_control_path and os.path.exists(old_control_path):
+                    try:
+                        os.unlink(old_control_path)
+                    except OSError:
+                        pass
+                if old_control_dir and old_control_dir != control_dir and os.path.exists(old_control_dir):
+                    try:
+                        os.rmdir(old_control_dir)
+                    except OSError:
+                        pass
             else:
                 _output({"success": False, "error": "Connection lost and reconnect failed. Run 'connect' again."})
                 return
@@ -452,7 +466,7 @@ def cmd_lab(args):
         cmd = f"lab force {exercise}"
     else:
         # Strip -ge/-lab suffix
-        lab_name = exercise.removesuffix('-ge').removesuffix('-lab')
+        lab_name = exercise
         cmd = f"{prefix} {action} {lab_name}"
     _err(f"Running: {cmd} (framework: {framework})")
 
@@ -495,7 +509,7 @@ def cmd_lab(args):
             if re.search(r'\bFAIL\b', stdout):
                 success = False
 
-        _output({
+        output_data = {
             "success": success,
             "return_code": result.returncode,
             "stdout": stdout,
@@ -503,7 +517,20 @@ def cmd_lab(args):
             "duration": round(duration, 2),
             "framework": framework,
             "command": cmd,
-        })
+        }
+
+        # Parse grade check results for structured output
+        if action == 'grade':
+            checks = []
+            for line in stdout.split('\n'):
+                m = re.match(r'\s*(PASS|FAIL)\s+(.+)', line)
+                if m:
+                    checks.append({"result": m.group(1), "description": m.group(2).strip()})
+            output_data["checks"] = checks
+            output_data["all_pass"] = all(c["result"] == "PASS" for c in checks) if checks else None
+            output_data["all_fail"] = all(c["result"] == "FAIL" for c in checks) if checks else None
+
+        _output(output_data)
     except subprocess.TimeoutExpired:
         _output({
             "success": False,
@@ -831,12 +858,13 @@ def cmd_write_file(args):
     remote_path = args.remote_path
     content_b64 = args.content
 
-    cmd = f"mkdir -p \"$(dirname '{remote_path}')\" && echo '{content_b64}' | base64 -d > '{remote_path}'"
+    quoted_path = _shell_quote(remote_path)
+    cmd = f"mkdir -p \"$(dirname {quoted_path})\" && base64 -d > {quoted_path}"
 
     try:
         result = subprocess.run(
             ['ssh'] + _ssh_opts(state) + [state["host"], cmd],
-            capture_output=True, text=True, timeout=30,
+            input=content_b64, capture_output=True, text=True, timeout=30,
         )
         _output({
             "success": result.returncode == 0,
@@ -944,7 +972,7 @@ def cmd_devcontainer_start(args):
     cmd = (f"podman run -d --name {container_name} "
            f"{args_str} "
            f"-v {project_dir}:/workspaces/{exercise_name}:Z "
-           f"-v {home_dir}/.ssh:{container_ssh_dir}:Z "
+           f"-v {home_dir}/.ssh:{container_ssh_dir}:z "
            f"{image} sleep infinity")
 
     ok, stdout, stderr = ssh_run(cmd, timeout=120)

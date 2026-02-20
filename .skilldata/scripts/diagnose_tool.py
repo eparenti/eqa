@@ -32,7 +32,7 @@ ERROR_PATTERNS = [
     },
     {
         "id": "ssh_permission",
-        "regex": r"Permission denied \(publickey|Permission denied \(password",
+        "regex": r"Permission denied \([^)]+\)",
         "category": "SSH/connectivity",
         "severity": "ENV",
         "title": "SSH Authentication Failed",

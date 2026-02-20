@@ -66,32 +66,39 @@ def _get_browser():
     state = _load_state()
 
     pw = sync_playwright().start()
-    browser = pw.chromium.launch(headless=True)
+    try:
+        browser = pw.chromium.launch(headless=True)
 
-    # Restore cookies/session from previous calls
-    storage_state = None
-    if os.path.exists(STORAGE_STATE_FILE):
+        # Restore cookies/session from previous calls
+        storage_state = None
+        if os.path.exists(STORAGE_STATE_FILE):
+            try:
+                storage_state = STORAGE_STATE_FILE
+            except Exception:
+                pass
+
+        context = browser.new_context(
+            ignore_https_errors=True,
+            viewport={"width": 1280, "height": 720},
+            storage_state=storage_state,
+        )
+        page = context.new_page()
+
+        # Restore last URL if we have one
+        last_url = state.get("last_url")
+        if last_url:
+            try:
+                page.goto(last_url, wait_until="domcontentloaded", timeout=15000)
+            except Exception:
+                pass
+
+        return pw, browser, page
+    except Exception:
         try:
-            storage_state = STORAGE_STATE_FILE
+            pw.stop()
         except Exception:
             pass
-
-    context = browser.new_context(
-        ignore_https_errors=True,
-        viewport={"width": 1280, "height": 720},
-        storage_state=storage_state,
-    )
-    page = context.new_page()
-
-    # Restore last URL if we have one
-    last_url = state.get("last_url")
-    if last_url:
-        try:
-            page.goto(last_url, wait_until="domcontentloaded", timeout=15000)
-        except Exception:
-            pass
-
-    return pw, browser, page
+        raise
 
 
 def _cleanup(pw, browser, page, save_url=True):
