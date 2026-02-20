@@ -9,6 +9,7 @@ import json
 import os
 import sys
 import traceback
+from pathlib import Path
 
 
 def _output(data):
@@ -50,6 +51,17 @@ def save_state(path, data):
     get_cache_dir()  # ensure directory exists
     with open(path, 'w') as f:
         json.dump(data, f)
+
+
+def find_epub(directory):
+    """Find most recent EPUB in directory or its .cache/generated/en-US/ subdir."""
+    directory = Path(directory)
+    for location in [directory, directory / ".cache" / "generated" / "en-US"]:
+        if location.exists():
+            epubs = list(location.glob("*.epub"))
+            if epubs:
+                return max(epubs, key=lambda p: p.stat().st_mtime)
+    return None
 
 
 def json_safe(func):

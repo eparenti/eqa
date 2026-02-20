@@ -17,7 +17,6 @@ Usage:
 
 import argparse
 import json
-import sys
 from datetime import datetime
 from collections import defaultdict
 
@@ -230,12 +229,11 @@ def generate_chapter_summary(results: list, course_code: str = "", chapter: str 
             lines.append(f"| {v['exercise']} | {v['phase']} | {v['actual']}s | {v['budget']}s | +{v['over_by']}s |")
         lines.append("")
 
-    # Collect all bugs
+    # Collect all bugs (copy to avoid mutating caller's data)
     all_bugs = []
     for r in results:
         for bug in r.get("bugs", []):
-            bug["exercise"] = r.get("exercise_id", "?")
-            all_bugs.append(bug)
+            all_bugs.append({**bug, "exercise": r.get("exercise_id", "?")})
 
     if all_bugs:
         lines.extend([

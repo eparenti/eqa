@@ -9,7 +9,6 @@ Usage:
 
 import argparse
 import re
-import sys
 from pathlib import Path
 
 from eqa_common import _output, _err, json_safe

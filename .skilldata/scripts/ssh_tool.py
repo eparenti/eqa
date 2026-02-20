@@ -18,7 +18,6 @@ Usage:
 """
 
 import argparse
-import base64
 import functools
 import json
 import os
@@ -174,6 +173,21 @@ def _check_connection(state: dict) -> bool:
         return False
 
 
+def _get_subnets(state):
+    """Detect classroom subnets via ip route on the remote host."""
+    try:
+        nets = subprocess.run(
+            ['ssh'] + _ssh_opts(state) + [state["host"],
+             "ip route | grep -v default | awk '{print $1}' | grep -v '^10\\.88\\.'"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if nets.returncode == 0:
+            return [s.strip() for s in nets.stdout.strip().split('\n') if s.strip()]
+    except Exception:
+        pass
+    return []
+
+
 def _detect_framework(state: dict) -> tuple:
     """Detect which lab framework is available."""
     host = state["host"]
@@ -327,17 +341,9 @@ def cmd_status(args):
         except Exception:
             pass
 
-        # Get classroom subnets
-        try:
-            nets = subprocess.run(
-                ['ssh'] + _ssh_opts(state) + [state["host"],
-                 "ip route | grep -v default | awk '{print $1}' | grep -v '^10\\.88\\.'"],
-                capture_output=True, text=True, timeout=5,
-            )
-            if nets.returncode == 0:
-                result["subnets"] = [s.strip() for s in nets.stdout.strip().split('\n') if s.strip()]
-        except Exception:
-            pass
+        subnets = _get_subnets(state)
+        if subnets:
+            result["subnets"] = subnets
 
     _output(result)
 
@@ -350,22 +356,13 @@ def cmd_tunnel(args, state):
         _output({"success": False, "error": "Connection lost. Run 'connect' again."})
         return
 
-    try:
-        nets = subprocess.run(
-            ['ssh'] + _ssh_opts(state) + [state["host"],
-             "ip route | grep -v default | awk '{print $1}' | grep -v '^10\\.88\\.'"],
-            capture_output=True, text=True, timeout=5,
-        )
-        subnets = [s.strip() for s in nets.stdout.strip().split('\n') if s.strip()]
-    except Exception:
-        subnets = []
-
+    subnets = _get_subnets(state)
     if not subnets:
         _output({"success": False, "error": "Could not detect classroom subnets"})
         return
 
     host = state["host"]
-    cmd = f"sudo sshuttle --dns -r {host} {' '.join(subnets)} -D"
+    cmd = f"sudo sshuttle --dns -r {shlex.quote(host)} {' '.join(subnets)} -D"
     _output({
         "success": True,
         "subnets": subnets,
@@ -692,10 +689,9 @@ def cmd_vm_exec(args, state):
         child = pexpect.spawn(console_cmd, timeout=timeout, encoding='utf-8')
         # Wait for console to connect, then send Enter to trigger prompt
         child.expect(r'Successfully connected|escape sequence', timeout=30)
-        import time as _time
-        _time.sleep(2)
+        time.sleep(2)
         child.sendline("")
-        _time.sleep(1)
+        time.sleep(1)
         child.sendline("")
 
         # Match login prompt or shell prompt (ANSI-tolerant)
@@ -873,7 +869,7 @@ def cmd_devcontainer_start(args, state):
     args_str = " ".join(run_args)
     cmd = (f"podman run -d --name {shlex.quote(container_name)} "
            f"{args_str} "
-           f"-v {project_dir}:/workspaces/{shlex.quote(exercise_name)}:Z "
+           f"-v {shlex.quote(project_dir)}:/workspaces/{shlex.quote(exercise_name)}:Z "
            f"-v {home_dir}/.ssh:{container_ssh_dir}:z "
            f"{shlex.quote(image)} sleep infinity")
 

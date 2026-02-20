@@ -18,7 +18,7 @@ from pathlib import Path
 
 import yaml
 
-from eqa_common import _output, _err, json_safe
+from eqa_common import _output, _err, find_epub, json_safe
 
 
 @json_safe
@@ -83,7 +83,7 @@ def _resolve_chapter(input_str: str, chapter_num: int) -> dict:
         if not lesson_dir:
             return {"success": False, "error": f"Lesson directory not found for {lesson_code}"}
 
-        epub = _find_epub_in_dir(lesson_dir)
+        epub = find_epub(lesson_dir)
         if not epub:
             epub = _try_build_epub(lesson_dir)
 
@@ -101,7 +101,7 @@ def _resolve_chapter(input_str: str, chapter_num: int) -> dict:
         }
     else:
         # Local chapter — use the course EPUB
-        epub = _find_epub_in_dir(course_dir)
+        epub = find_epub(course_dir)
         if not epub:
             epub = _try_build_epub(course_dir)
         if not epub:
@@ -144,7 +144,7 @@ def _resolve_input(input_str: str) -> dict:
 
     # Directory
     if input_path.is_dir():
-        epub = _find_epub_in_dir(input_path)
+        epub = find_epub(input_path)
         if epub:
             return {
                 "success": True,
@@ -172,7 +172,7 @@ def _resolve_input(input_str: str) -> dict:
 
         candidate = base / input_str
         if candidate.is_dir():
-            epub = _find_epub_in_dir(candidate)
+            epub = find_epub(candidate)
             if epub:
                 return {
                     "success": True,
@@ -183,7 +183,7 @@ def _resolve_input(input_str: str) -> dict:
 
         for lesson_dir in base.glob(f"*-lessons/{input_str}"):
             if lesson_dir.is_dir():
-                epub = _find_epub_in_dir(lesson_dir)
+                epub = find_epub(lesson_dir)
                 if epub:
                     return {
                         "success": True,
@@ -255,16 +255,6 @@ def _find_lesson_dir(course_dir: Path, lesson_code: str) -> Path:
     return None
 
 
-def _find_epub_in_dir(directory: Path) -> Path:
-    """Find most recent EPUB in directory."""
-    for location in [directory, directory / ".cache" / "generated" / "en-US"]:
-        if location.exists():
-            epubs = list(location.glob("*.epub"))
-            if epubs:
-                return max(epubs, key=lambda p: p.stat().st_mtime)
-    return None
-
-
 def _try_build_epub(directory: Path) -> Path:
     """Try to build EPUB using sk."""
     sk_path = shutil.which("sk")
@@ -278,7 +268,7 @@ def _try_build_epub(directory: Path) -> Path:
             cwd=directory, capture_output=True, text=True, timeout=600,
         )
         if result.returncode == 0:
-            return _find_epub_in_dir(directory)
+            return find_epub(directory)
     except Exception:
         pass
     return None

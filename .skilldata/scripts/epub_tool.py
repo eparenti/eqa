@@ -21,7 +21,7 @@ import sys
 import zipfile
 from pathlib import Path
 
-from eqa_common import _output, _err, get_cache_dir, json_safe
+from eqa_common import _output, _err, get_cache_dir, find_epub, json_safe
 
 # Lazy-loaded at first use
 _bs4_loaded = False
@@ -790,7 +790,7 @@ def cmd_build(args):
         return
 
     if not args.force:
-        epub = _find_epub(course_path)
+        epub = find_epub(course_path)
         if epub:
             _output({"success": True, "epub_path": str(epub), "cached": True})
             return
@@ -813,7 +813,7 @@ def cmd_build(args):
             cwd=course_path, capture_output=True, text=True, timeout=600,
         )
         if result.returncode == 0:
-            epub = _find_epub(course_path)
+            epub = find_epub(course_path)
             if epub:
                 _output({"success": True, "epub_path": str(epub)})
                 return
@@ -829,16 +829,6 @@ def cmd_build(args):
         _output({"success": False, "error": "Build timed out"})
     except Exception as e:
         _output({"success": False, "error": str(e)})
-
-
-def _find_epub(directory: Path) -> Path:
-    """Find most recent EPUB in directory."""
-    for location in [directory, directory / ".cache" / "generated" / "en-US"]:
-        if location.exists():
-            epubs = list(location.glob("*.epub"))
-            if epubs:
-                return max(epubs, key=lambda p: p.stat().st_mtime)
-    return None
 
 
 def main():

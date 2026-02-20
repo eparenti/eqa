@@ -23,7 +23,6 @@ Usage:
 """
 
 import argparse
-import atexit
 import json
 import os
 import signal
@@ -31,7 +30,6 @@ import socket
 import struct
 import subprocess
 import sys
-import threading
 import time
 
 from eqa_common import _output, _err, get_cache_dir, get_state_path, load_state, save_state, json_safe
@@ -41,6 +39,10 @@ STATE_FILE = get_state_path("web")
 STORAGE_STATE_FILE = os.path.join(get_cache_dir(), "web-storage.json")
 DAEMON_SOCKET_PATH = os.path.join(get_cache_dir(), "web-daemon.sock")
 DAEMON_PID_FILE = os.path.join(get_cache_dir(), "web-daemon.pid")
+
+# Truncation limits for text returned in JSON output
+MAX_PAGE_TEXT = 5000
+MAX_API_BODY = 10000
 
 
 # ---------------------------------------------------------------------------
@@ -80,13 +82,12 @@ def _daemon_running():
     """Check if daemon is running and reachable."""
     if not os.path.exists(DAEMON_SOCKET_PATH):
         return False
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
-        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         s.settimeout(2)
         s.connect(DAEMON_SOCKET_PATH)
         _send_message(s, {"subcommand": "ping"})
         resp = _recv_message(s)
-        s.close()
         return resp is not None and resp.get("pong")
     except (ConnectionRefusedError, OSError, socket.timeout):
         # Stale socket file — clean up
@@ -95,17 +96,20 @@ def _daemon_running():
         except OSError:
             pass
         return False
+    finally:
+        s.close()
 
 
 def _send_to_daemon(subcommand, args_dict):
     """Send a command to the daemon, return the JSON response."""
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    s.settimeout(120)
-    s.connect(DAEMON_SOCKET_PATH)
-    _send_message(s, {"subcommand": subcommand, "args": args_dict})
-    resp = _recv_message(s)
-    s.close()
-    return resp
+    try:
+        s.settimeout(120)
+        s.connect(DAEMON_SOCKET_PATH)
+        _send_message(s, {"subcommand": subcommand, "args": args_dict})
+        return _recv_message(s)
+    finally:
+        s.close()
 
 
 # ---------------------------------------------------------------------------
@@ -131,12 +135,7 @@ def _get_browser():
         browser = pw.chromium.launch(headless=True)
 
         # Restore cookies/session from previous calls
-        storage_state = None
-        if os.path.exists(STORAGE_STATE_FILE):
-            try:
-                storage_state = STORAGE_STATE_FILE
-            except Exception:
-                pass
+        storage_state = STORAGE_STATE_FILE if os.path.exists(STORAGE_STATE_FILE) else None
 
         context = browser.new_context(
             ignore_https_errors=True,
@@ -201,6 +200,7 @@ class BrowserDaemon:
 
     def start(self):
         """Launch browser and listen on Unix socket."""
+        import atexit
         from playwright.sync_api import sync_playwright
 
         # Clean up stale socket
@@ -374,7 +374,7 @@ class BrowserDaemon:
     def _do_page_text(self, args):
         try:
             text = self.page.inner_text("body")
-            return {"success": True, "text": text[:5000], "url": self.page.url, "title": self.page.title()}
+            return {"success": True, "text": text[:MAX_PAGE_TEXT], "url": self.page.url, "title": self.page.title()}
         except Exception as e:
             return {"success": False, "error": str(e)}
 
@@ -394,21 +394,19 @@ class BrowserDaemon:
 
     def _do_login(self, args):
         try:
-            import time as _time
-
             self.page.goto(args["url"], timeout=30000)
             self.page.wait_for_selector(args.get("username_selector", "#inputUsername"), timeout=30000)
-            _time.sleep(1)
+            time.sleep(1)
 
             self.page.fill(args.get("username_selector", "#inputUsername"), args["username"], timeout=10000)
             self.page.fill(args.get("password_selector", "#inputPassword"), args["password"], timeout=10000)
 
             self.page.click(args.get("submit_selector", "button[type='submit']"), timeout=10000)
-            _time.sleep(10)
+            time.sleep(10)
 
             if args.get("then"):
                 self.page.goto(args["then"], wait_until="domcontentloaded", timeout=30000)
-                _time.sleep(5)
+                time.sleep(5)
                 try:
                     self.page.wait_for_selector("nav, [data-test], .pf-v6-c-page, .co-m-pane__body", timeout=15000)
                 except Exception:
@@ -422,7 +420,7 @@ class BrowserDaemon:
 
             if args.get("then"):
                 try:
-                    result["text"] = self.page.inner_text("body")[:5000]
+                    result["text"] = self.page.inner_text("body")[:MAX_PAGE_TEXT]
                 except Exception:
                     result["text"] = ""
 
@@ -549,7 +547,7 @@ def cmd_page_text(args):
     pw, browser, page = _get_browser()
     try:
         text = page.inner_text("body")
-        _output({"success": True, "text": text[:5000], "url": page.url, "title": page.title()})
+        _output({"success": True, "text": text[:MAX_PAGE_TEXT], "url": page.url, "title": page.title()})
     except Exception as e:
         _output({"success": False, "error": str(e)})
     finally:
@@ -582,26 +580,31 @@ def cmd_evaluate(args):
         _cleanup(pw, browser, page)
 
 
+def _insecure_ssl_ctx():
+    """Create an SSL context that skips certificate verification (for lab self-signed certs)."""
+    import ssl
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+
 @json_safe
 def cmd_api_get(args):
     """Make an HTTP GET request (no browser needed)."""
     import urllib.request
-    import ssl
 
     headers = json.loads(args.headers) if args.headers else {}
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
 
     try:
         req = urllib.request.Request(args.url, headers=headers)
-        with urllib.request.urlopen(req, context=ctx, timeout=30) as resp:
+        with urllib.request.urlopen(req, context=_insecure_ssl_ctx(), timeout=30) as resp:
             body = resp.read().decode('utf-8', errors='replace')
             _output({
                 "success": True,
                 "status": resp.status,
                 "headers": dict(resp.headers),
-                "body": body[:10000],
+                "body": body[:MAX_API_BODY],
             })
     except Exception as e:
         _output({"success": False, "error": str(e)})
@@ -611,26 +614,21 @@ def cmd_api_get(args):
 def cmd_api_post(args):
     """Make an HTTP POST request (no browser needed)."""
     import urllib.request
-    import ssl
 
     headers = json.loads(args.headers) if args.headers else {}
     if "Content-Type" not in headers:
         headers["Content-Type"] = "application/json"
 
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-
     try:
         data = args.data.encode('utf-8')
         req = urllib.request.Request(args.url, data=data, headers=headers, method='POST')
-        with urllib.request.urlopen(req, context=ctx, timeout=30) as resp:
+        with urllib.request.urlopen(req, context=_insecure_ssl_ctx(), timeout=30) as resp:
             body = resp.read().decode('utf-8', errors='replace')
             _output({
                 "success": True,
                 "status": resp.status,
                 "headers": dict(resp.headers),
-                "body": body[:10000],
+                "body": body[:MAX_API_BODY],
             })
     except Exception as e:
         _output({"success": False, "error": str(e)})
@@ -650,24 +648,22 @@ def cmd_login(args):
 
     pw, browser, page = _get_browser()
     try:
-        import time as _time
-
         page.goto(args.url, timeout=30000)
         # Wait for login form (page may redirect through OAuth first)
         page.wait_for_selector(args.username_selector, timeout=30000)
-        _time.sleep(1)
+        time.sleep(1)
 
         page.fill(args.username_selector, args.username, timeout=10000)
         page.fill(args.password_selector, password, timeout=10000)
 
         page.click(args.submit_selector, timeout=10000)
-        _time.sleep(10)  # Wait for OAuth redirect chain to complete
+        time.sleep(10)  # Wait for OAuth redirect chain to complete
 
         # Navigate to target page after login
         if args.then:
             page.goto(args.then, wait_until="domcontentloaded", timeout=30000)
             # Wait for SPA content to render
-            _time.sleep(5)
+            time.sleep(5)
             # Try to wait for page content (non-fatal)
             try:
                 page.wait_for_selector("nav, [data-test], .pf-v6-c-page, .co-m-pane__body", timeout=15000)
@@ -683,7 +679,7 @@ def cmd_login(args):
         # Get page text if we navigated to a target
         if args.then:
             try:
-                result["text"] = page.inner_text("body")[:5000]
+                result["text"] = page.inner_text("body")[:MAX_PAGE_TEXT]
             except Exception:
                 result["text"] = ""
 
