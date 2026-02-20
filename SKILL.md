@@ -1,6 +1,6 @@
 ---
 name: eqa
-version: 5.4.0
+version: 6.0.0
 description: Automated exercise QA for Red Hat Training courses
 authors:
   - Ed Parenti <eparenti@redhat.com>
@@ -173,6 +173,63 @@ curl -sk -o /dev/null -w '%{http_code}' https://<any-classroom-url>/
 ```
 
 This step is **optional** — only needed for TC-WEB testing with Playwright or direct `curl` from the local machine. If skipped, use `ssh_tool.py run "curl ..."` to access web services via the workstation instead.
+
+## Testing Methodology
+
+### Two-Pass Approach
+
+**Pass 1: Student Simulation** — Execute the exercise as a student would:
+- TC-PREREQ → TC-EXEC → TC-STUDENTSIM → TC-VERIFY (GEs) → TC-CLEAN
+
+**Pass 2: QA Validation** — Validate grading, solutions, and reliability:
+- TC-SOL → TC-GRADE (Labs) → TC-IDEM → TC-E2E → TC-CONTRACT → TC-INSTRUCT → TC-SECURITY → TC-WEB
+
+Run Pass 1 first. If it passes, run Pass 2 for thorough validation. If Pass 1 fails, document the bugs and skip Pass 2.
+
+### Batch Chapter Testing
+
+When testing all exercises in a chapter:
+1. Get the exercise list from `epub_tool.py parse` filtered by chapter
+2. Test each exercise sequentially (start → sim → clean)
+3. Track results as JSON for each exercise
+4. Use `report_tool.py chapter` to generate the summary report
+5. Use `report_tool.py score` to calculate the quality score
+
+### Error Summary Pattern
+
+Collect ALL bugs before reporting (don't fail-fast):
+- Students see all problems at once
+- Fix multiple issues in one iteration
+- Exception: P0 blockers may stop testing early
+
+When any command fails, run the output through `diagnose_tool.py analyze` for automatic root cause identification.
+
+### Performance Budgets
+
+Track execution times and flag slow exercises:
+
+| Phase | Budget | Flag if exceeds |
+|-------|--------|-----------------|
+| `lab start` | 60s | Slow start — may frustrate students |
+| `lab finish` | 60s | Slow cleanup |
+| Student simulation | 600s (10 min) | Exercise may be too complex |
+| Total exercise | 900s (15 min) | Total time excessive |
+
+Use `report_tool.py score` to check performance budget violations across a chapter.
+
+### Quality Score (0-100)
+
+Calculated automatically by `report_tool.py score`:
+- **Coverage** (30 pts): exercises tested / total
+- **Defects** (40 pts): penalty per bug (P0=-40, P1=-20, P2=-5, P3=-1)
+- **Reliability** (30 pts): cleanup + idempotency pass rate
+
+| Score | Assessment |
+|-------|------------|
+| 90-100 | Ready for release |
+| 70-89 | Conditional — fix P1+ bugs |
+| 50-69 | Needs work — multiple issues |
+| <50 | Not ready |
 
 ## Test Categories
 
@@ -623,15 +680,20 @@ When testing a chapter or multiple exercises, generate a summary report after al
 
 ## Utility Reference
 
-See `.skilldata/docs/tools-reference.md` for full tool documentation (ssh_tool.py, epub_tool.py, course_tool.py, profile_tool.py, web_tool.py).
+See `.skilldata/docs/tools-reference.md` for full tool documentation.
 
-Key commands used most often:
+Key commands:
+- `ssh_tool.py connect` — connect to workstation (auto-detects from ~/.ssh/config)
 - `ssh_tool.py run <cmd>` — execute command on workstation
 - `ssh_tool.py lab <action> <exercise>` — lab start/finish/grade/force/solve
 - `ssh_tool.py vm-exec <vm> -n <ns> -c <cmd>` — run command inside a VM
 - `ssh_tool.py vm-disks <vm> -n <ns>` — list VM disk attachments as JSON
 - `ssh_tool.py tunnel` — generate sshuttle command for network tunnel
 - `web_tool.py login <url> --username <u> --password <p> --then <url>` — web console login
+- `diagnose_tool.py analyze <text>` — diagnose error output, suggest fixes
+- `report_tool.py exercise --data <json>` — generate exercise report
+- `report_tool.py chapter --data <json>` — generate chapter summary with quality score
+- `report_tool.py score --data <json>` — calculate quality score (0-100)
 
 ## Course Patterns
 

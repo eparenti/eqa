@@ -107,9 +107,53 @@ def _shell_quote(s: str) -> str:
     return "'" + s.replace("'", "'\\''") + "'"
 
 
+def _detect_workstation() -> str:
+    """Auto-detect workstation hostname from ~/.ssh/config.
+
+    Looks for hosts named 'workstation', or containing 'workstation' in
+    their hostname. Falls back to 'workstation' if not found.
+    """
+    config_path = os.path.expanduser("~/.ssh/config")
+    if not os.path.exists(config_path):
+        return "workstation"
+
+    try:
+        current_host = None
+        current_hostname = None
+        candidates = []
+
+        for path in [config_path]:
+            with open(path) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith('#'):
+                        continue
+                    if line.lower().startswith('host '):
+                        if current_host and 'workstation' in current_host.lower():
+                            candidates.append((current_host, current_hostname or current_host))
+                        current_host = line.split(None, 1)[1].split()[0]
+                        current_hostname = None
+                    elif line.lower().startswith('hostname '):
+                        current_hostname = line.split(None, 1)[1]
+                # Handle last entry
+                if current_host and 'workstation' in current_host.lower():
+                    candidates.append((current_host, current_hostname or current_host))
+
+        if candidates:
+            # Prefer exact match "workstation" over partial matches
+            for alias, hostname in candidates:
+                if alias.lower() == 'workstation':
+                    return alias
+            return candidates[0][0]
+    except Exception:
+        pass
+
+    return "workstation"
+
+
 def cmd_connect(args):
     """Start ControlMaster, detect framework, persist state."""
-    host = args.host
+    host = args.host or _detect_workstation()
     control_dir = tempfile.mkdtemp(prefix="eqa-ssh-")
     control_path = os.path.join(control_dir, f"{host}.sock")
 
@@ -1121,7 +1165,7 @@ def main():
 
     # connect
     p_connect = subparsers.add_parser("connect")
-    p_connect.add_argument("--host", default="workstation")
+    p_connect.add_argument("--host", default=None, help="Workstation hostname (auto-detected from ~/.ssh/config if omitted)")
     p_connect.set_defaults(func=cmd_connect)
 
     # status

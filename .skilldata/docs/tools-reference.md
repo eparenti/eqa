@@ -4,7 +4,7 @@
 
 | Subcommand | Description | Key Options |
 |------------|-------------|-------------|
-| `connect` | Start ControlMaster | `--host workstation` |
+| `connect` | Start ControlMaster (auto-detects workstation from ~/.ssh/config) | `--host <hostname>` |
 | `status` | Check connection, framework, disk space | |
 | `run <cmd>` | Execute command (auto-reconnects) | `--timeout 120` |
 | `lab <action> <exercise>` | Framework-aware lab command (start/finish/grade/install/solve/force) | `--timeout 600` |
@@ -62,6 +62,28 @@
 
 Requires: `pip install playwright && playwright install chromium`
 The `api-get` and `api-post` subcommands do NOT require Playwright (use urllib directly).
+
+## diagnose_tool.py
+
+| Subcommand | Description | Key Options |
+|------------|-------------|-------------|
+| `analyze <text>` | Diagnose error output, identify root cause, suggest fixes | `--file <path>` |
+
+Returns JSON with `findings[]` — each finding has `id`, `title`, `severity`, `category`, `fix`, `matched_text`.
+
+Recognizes: SSH errors, Ansible errors (missing collections, undefined vars, YAML syntax), OCP errors (NotFound, Forbidden, timeouts), DynoLabs errors (manifest, CatalogSource, lab state), environment issues (disk full, EE pull failures).
+
+## report_tool.py
+
+| Subcommand | Description | Key Options |
+|------------|-------------|-------------|
+| `exercise --data <json>` | Generate markdown exercise report | |
+| `chapter --data <json>` | Generate chapter summary with quality score | `--course`, `--chapter` |
+| `score --data <json>` | Calculate quality score (0-100) | |
+
+Quality score components: Coverage (30pts), Defects (40pts), Reliability (30pts).
+
+Performance budget thresholds: lab start >60s, lab finish >60s, student sim >600s, total >900s.
 
 ## AAP Controller CLI
 
