@@ -18,7 +18,7 @@ from pathlib import Path
 
 import yaml
 
-from eqa_common import _output, _err, find_epub, json_safe
+from eqa_common import _output, _err, find_epub, json_safe, load_config
 
 
 @json_safe
@@ -161,9 +161,10 @@ def _resolve_input(input_str: str) -> dict:
         return {"success": False, "error": f"No EPUB found in {input_path}"}
 
     # Lesson code search
+    config = load_config()
     search_dirs = [
         Path.cwd(),
-        Path.home() / "git-repos" / "active",
+        Path(config["repos_dir"]),
     ]
 
     for base in search_dirs:
@@ -201,9 +202,10 @@ def _find_course_dir(input_str: str) -> Path:
     if input_path.is_dir() and (input_path / "outline.yml").exists():
         return input_path
 
+    config = load_config()
     search_dirs = [
         Path.cwd(),
-        Path.home() / "git-repos" / "active",
+        Path(config["repos_dir"]),
     ]
 
     for base in search_dirs:
@@ -237,13 +239,14 @@ def _find_lesson_dir(course_dir: Path, lesson_code: str) -> Path:
     if sibling.is_dir():
         return sibling
 
-    # Search in ~/git-repos/active/
-    active = Path.home() / "git-repos" / "active" / lesson_code
+    # Search in repos_dir
+    config = load_config()
+    active = Path(config["repos_dir"]) / lesson_code
     if active.is_dir():
         return active
 
-    # Search in ~/git-repos/archive/*/
-    for d in (Path.home() / "git-repos" / "archive").glob(f"*/{lesson_code}"):
+    # Search in archive_dir
+    for d in Path(config["archive_dir"]).glob(f"*/{lesson_code}"):
         if d.is_dir():
             return d
 

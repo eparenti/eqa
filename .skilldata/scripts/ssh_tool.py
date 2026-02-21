@@ -26,6 +26,7 @@ import shlex
 import subprocess
 import sys
 import time
+import uuid
 
 from eqa_common import _output, _err, get_cache_dir, get_state_path, load_state, save_state, json_safe
 
@@ -713,7 +714,7 @@ def cmd_vm_exec(args, state):
                 child.expect(r'[\]#\$]', timeout=15)
 
         # At shell prompt — run the command with exit code marker
-        marker = "__EQA_EXIT__"
+        marker = f"EQA_EXIT_{uuid.uuid4().hex}"
         child.sendline(f"{command}; echo {marker}=$?")
         child.expect(f'{marker}=(\\d+)', timeout=timeout)
         output_buffer.append(child.before or "")
@@ -995,6 +996,107 @@ def cmd_coursetest(args, state):
 
 
 @json_safe
+@requires_connection
+def cmd_wait_for(args, state):
+    """Poll until a condition is met on the remote host."""
+    mode = args.mode
+    target = args.target
+    timeout = args.timeout
+    interval = args.interval
+
+    if mode == "tcp":
+        parts = target.rsplit(":", 1)
+        if len(parts) != 2:
+            _output({"success": False, "error": "tcp mode requires --target host:port"})
+            return
+        host, port = parts[0], parts[1]
+        check_cmd = f"nc -z -w1 {shlex.quote(host)} {shlex.quote(port)}"
+    elif mode == "http":
+        check_cmd = f"curl -sk -o /dev/null -w '%{{http_code}}' {shlex.quote(target)}"
+    elif mode == "command":
+        check_cmd = target
+    elif mode == "file":
+        check_cmd = f"test -f {shlex.quote(target)}"
+    else:
+        _output({"success": False, "error": f"Unknown mode: {mode}"})
+        return
+
+    start_time = time.time()
+    attempts = 0
+
+    while True:
+        attempts += 1
+        ok, stdout, stderr, rc, _ = _ssh_exec(state, check_cmd, timeout=30)
+
+        if mode == "http":
+            code = stdout.strip()
+            ok = code.startswith("2") or code.startswith("3")
+
+        if ok:
+            elapsed = round(time.time() - start_time, 2)
+            _output({"success": True, "elapsed": elapsed, "attempts": attempts})
+            return
+
+        elapsed = time.time() - start_time
+        if elapsed + interval > timeout:
+            _output({
+                "success": False,
+                "error": f"Timed out after {round(elapsed, 2)}s ({attempts} attempts)",
+                "elapsed": round(elapsed, 2),
+                "attempts": attempts,
+            })
+            return
+
+        time.sleep(interval)
+
+
+@json_safe
+@requires_connection
+def cmd_diff(args, state):
+    """Compare remote file against expected content."""
+    import base64
+    import difflib
+
+    remote_path = args.remote_path
+    expected_b64 = args.expected
+
+    try:
+        expected_content = base64.b64decode(expected_b64).decode("utf-8")
+    except Exception as e:
+        _output({"success": False, "error": f"Failed to decode expected content: {e}"})
+        return
+
+    ok, stdout, stderr, rc, duration = _ssh_exec(
+        state, f"cat {shlex.quote(remote_path)}", timeout=30,
+    )
+    if not ok:
+        _output({
+            "success": False,
+            "error": f"Failed to read remote file: {stderr}",
+            "return_code": rc,
+        })
+        return
+
+    remote_content = stdout
+
+    if remote_content == expected_content:
+        _output({"success": True, "match": True})
+        return
+
+    diff_lines = list(difflib.unified_diff(
+        expected_content.splitlines(keepends=True),
+        remote_content.splitlines(keepends=True),
+        fromfile="expected",
+        tofile=remote_path,
+    ))
+    _output({
+        "success": True,
+        "match": False,
+        "diff": "".join(diff_lines),
+    })
+
+
+@json_safe
 def cmd_disconnect(args):
     """Tear down ControlMaster connection."""
     state = load_state(STATE_FILE)
@@ -1120,6 +1222,20 @@ def main():
     p_coursetest.add_argument("--dry-run", action="store_true")
     p_coursetest.add_argument("--timeout", type=int, default=3600)
     p_coursetest.set_defaults(func=cmd_coursetest)
+
+    # wait-for
+    p_wait = subparsers.add_parser("wait-for")
+    p_wait.add_argument("--mode", required=True, choices=["tcp", "http", "command", "file"])
+    p_wait.add_argument("--target", required=True, help="host:port, URL, shell command, or file path")
+    p_wait.add_argument("--timeout", type=int, default=120)
+    p_wait.add_argument("--interval", type=int, default=5)
+    p_wait.set_defaults(func=cmd_wait_for)
+
+    # diff
+    p_diff = subparsers.add_parser("diff")
+    p_diff.add_argument("remote_path")
+    p_diff.add_argument("--expected", required=True, help="Base64-encoded expected content")
+    p_diff.set_defaults(func=cmd_diff)
 
     # disconnect
     p_disconnect = subparsers.add_parser("disconnect")
