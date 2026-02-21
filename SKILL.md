@@ -1,6 +1,6 @@
 ---
 name: eqa
-version: 6.0.0
+version: 7.1.0
 description: Automated exercise QA for Red Hat Training courses
 authors:
   - Ed Parenti <eparenti@redhat.com>
@@ -41,7 +41,7 @@ Fully automated quality assurance for ANY Red Hat Training course. Works with an
 
 ## Critical Rules
 
-These six rules prevent the most common time-wasting mistakes. Internalize them before testing.
+These seven rules prevent the most common time-wasting mistakes. Internalize them before testing.
 
 1. **Paths must be absolute** — `devcontainer-start` does not expand `~`. Always use `/home/student/<exercise>`.
 2. **write-file requires base64** — Encode content with `base64 -w0 /tmp/file.yml`, then pass via `--content`. Write locally first, encode, then upload.
@@ -49,6 +49,17 @@ These six rules prevent the most common time-wasting mistakes. Internalize them 
 4. **Dev container podman variant** — The tool checks `.devcontainer/podman/devcontainer.json` first (uses local registry, works). The default `devcontainer.json` may reference `registry.redhat.io` (fails without auth).
 5. **ansible-navigator: always `-m stdout`** — Without it the interactive TUI hangs. Every `ansible-navigator run` command must include `-m stdout`.
 6. **epub_tool commands are dicts** — Parsed commands from instructions JSON are `{"text": "...", ...}` dicts. Access with `.get("text")`, not string slicing. File actions are nested in `sub_steps[].file_actions[]`.
+7. **URLs and hostnames come from the EPUB** — Never assume, carry over, or hardcode URLs, hostnames, or ports from prior exercises or session context. Always extract them from the current exercise's parsed instructions. The EPUB is the single source of truth for what URLs the student uses (e.g., `aap.lab.example.com` vs `controller.lab.example.com`, port 443 vs 8443). If a URL works in one exercise, that does not mean the same hostname/port applies to a different exercise.
+
+### A Note on Examples
+
+All hostnames, URLs, credentials, port numbers, and course-specific values in the recipes and examples below are **illustrative patterns** — they show the shape of the command, not the actual values to use. Always extract real values from:
+
+1. **The EPUB** (parsed via `epub_tool.py`) — URLs, hostnames, ports, credentials, file content
+2. **The course profile** (from `profile_tool.py`) — managed hosts, technology stack, dev container config
+3. **The live environment** (via `ssh_tool.py`) — dynamic resource IDs, API-discovered values
+
+Never copy an example value from this document into a live command.
 
 ## Setup Workflow
 
@@ -86,6 +97,44 @@ python3 ~/git-repos/eqa/.skilldata/scripts/profile_tool.py build <extract_dir>
 
 Analyzes EPUB content to detect: technology stack, dev containers, tool locations, teaching patterns, ansible collections, real hosts, network devices.
 
+### 4.5. Load HLD Document (Optional)
+
+Ask the user: "Do you have an HLD (High-Level Design) document for this course? Loading it gives context about exercise intent, scenarios, and developer notes."
+
+If the user provides an HLD path (`.docx` format):
+
+1. Extract text from the docx using Python's `zipfile` and `xml.etree.ElementTree`:
+   ```python
+   import zipfile
+   from xml.etree import ElementTree as ET
+   docx = zipfile.ZipFile('<path-to-hld.docx>')
+   xml = docx.read('word/document.xml')
+   tree = ET.fromstring(xml)
+   lines = []
+   for p in tree.iter('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}p'):
+       texts = [t.text for t in p.iter('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}t') if t.text]
+       line = ''.join(texts).strip()
+       if line:
+           lines.append(line)
+   ```
+
+2. Parse the HLD for key information per lesson/section:
+   - **Lesson goals** — what each chapter/lesson teaches
+   - **Section types** — lecture, GE, quiz, lab
+   - **Section objectives** — what each exercise should accomplish
+   - **Scenarios/use cases** — the real-world context for the exercise
+   - **Notes to developer** — design intent, known constraints, references to prior course sections
+   - **Lesson status** — New, Existing, Major Update
+   - **Complexity** — Low/Med/Hi
+
+3. Store HLD context in session memory. Use it during:
+   - **TC-STUDENTSIM**: Understanding teaching intent (step 2 of pre-execution checklist) — the HLD's "Notes to Developer" may explain why an exercise is designed a certain way
+   - **TC-INSTRUCT**: Validating that exercise instructions achieve the stated objective from the HLD
+   - **TC-CONTRACT**: Checking if grading aligns with the HLD's stated objectives
+   - **Report writing**: Include the HLD objective in the exercise report summary for traceability
+
+If the user declines or no HLD exists, skip this step — all other functionality works without it.
+
 ### 5. Ensure Correct Lab Package
 
 The grading package on the workstation **must match** the EPUB being tested. A version mismatch means grading checks, VM names, and exercise logic may differ from the EPUB instructions — causing false test failures.
@@ -97,7 +146,7 @@ The DynoLabs 5 Rust CLI (`/usr/local/bin/lab`) manages Python grading packages v
 - **Lab manifest** (`~/.grading/lab_manifest.json`): Maps exercise names to course SKUs and versions
 - **Course packages** (e.g., `rht-labs-do316`, `rht-labs-au0022l`): Python packages containing grading scripts, Ansible playbooks, and lab materials
 - **Active course**: Only one course is "active" at a time (`lab version` shows it)
-- **PyPI mirror**: Packages are fetched from `pypi.apps.tools-na.prod.nextcle.com`
+- **PyPI mirror**: Packages are fetched from the Red Hat internal PyPI mirror (typically `pypi.apps.tools-na.prod.nextcle.com`, but may vary by environment)
 
 #### Package installation commands
 
@@ -355,18 +404,67 @@ ssh_tool.py run "cd /home/student/<exercise> && ansible-navigator run playbook.y
 ssh_tool.py devcontainer-run "cd /home/student/<exercise> && ansible-navigator run playbook.yml -m stdout"
 ```
 
+### Recipe: Git Clone with Credentials
+
+Gitea credentials often contain special characters (e.g., `Student@123`). URL-encode them in clone URLs.
+
+```bash
+# The @ in the password must be encoded as %40
+ssh_tool.py run "git clone http://student:Student%40123@utility.lab.example.com:3000/student/<repo>.git"
+
+# Common URL encodings: @ → %40, # → %23, $ → %24, % → %25, & → %26, + → %2B
+# Get credentials from the course profile (gitea_user, gitea_password) or EPUB instructions
+```
+
+### Recipe: Gitea API Authentication
+
+When Gitea credentials contain `@` (e.g., `Student@123`), `curl -u` fails. Use base64 Basic auth or token auth:
+
+```bash
+# Option 1: Base64-encoded Basic auth header
+# Encode "student:Student@123" → "c3R1ZGVudDpTdHVkZW50QDEyMw=="
+ssh_tool.py run "curl -sk -H 'Authorization: Basic <base64(user:pass)>' http://utility.lab.example.com:3000/api/v1/repos/student/<repo>/hooks"
+
+# Option 2: Create a token first, then use it
+# Note: Gitea API tokens require explicit scopes (e.g., write:repository)
+ssh_tool.py run "curl -sk -X POST -H 'Authorization: Basic <base64>' -H 'Content-Type: application/json' \
+  -d '{\"name\": \"eqa-token\", \"scopes\": [\"write:repository\"]}' \
+  http://utility.lab.example.com:3000/api/v1/users/student/tokens"
+# Returns: {"sha1": "<token>", ...}
+
+# Then use the token:
+ssh_tool.py run "curl -sk -H 'Authorization: token <token>' http://utility.lab.example.com:3000/api/v1/..."
+```
+
+### Recipe: Podman in Lab Environments
+
+Lab environments use self-signed certificates. Interactive `podman` commands prompt for TLS verification, but automation needs explicit flags.
+
+```bash
+# Login (non-interactive — add --tls-verify=false for self-signed certs)
+ssh_tool.py run "podman login -u <user> -p <password> <registry-host> --tls-verify=false"
+
+# Pull (same flag needed)
+ssh_tool.py run "podman pull --tls-verify=false <registry-host>/<image>:<tag>"
+
+# The EPUB may not include --tls-verify=false because the student runs interactively
+# and podman prompts. In automation, always add it for lab registries.
+```
+
 ### Recipe: Managed Host Commands
+
+**Note:** Replace `<managed-host>` with actual hostnames from the course profile's `real_hosts` field or the EPUB instructions. Never assume hostnames — they vary by course.
 
 ```bash
 # Privileged operations — use devops (has NOPASSWD sudo)
-ssh_tool.py run "ssh devops@servera 'sudo systemctl restart httpd'"
-ssh_tool.py run "ssh devops@serverb 'sudo cat /etc/shadow'"
+ssh_tool.py run "ssh devops@<managed-host> 'sudo systemctl restart httpd'"
+ssh_tool.py run "ssh devops@<managed-host> 'sudo cat /etc/shadow'"
 
 # Unprivileged operations — student is fine
-ssh_tool.py run "ssh student@servera 'cat /etc/motd'"
+ssh_tool.py run "ssh student@<managed-host> 'cat /etc/motd'"
 
 # NEVER do this — hangs waiting for password:
-# ssh_tool.py run "ssh student@servera 'sudo systemctl restart httpd'"
+# ssh_tool.py run "ssh student@<managed-host> 'sudo systemctl restart httpd'"
 ```
 
 ### Recipe: Parsing Instructions JSON
@@ -414,6 +512,19 @@ verification_steps = [
     for sub in step["sub_steps"]
     if sub.get("is_verification")
 ]
+
+# Handling "...output omitted..." in file_actions content
+# The EPUB often truncates long files. If a file_action contains
+# "...output omitted..." or similar, the content is INCOMPLETE.
+# Read the actual file from the repo/workstation to get full content,
+# then apply only the change the EPUB describes.
+for step in instructions["steps"]:
+    for sub in step["sub_steps"]:
+        for fa in sub.get("file_actions", []):
+            if "output omitted" in fa.get("content", ""):
+                # Don't use this content as-is — read the real file first,
+                # then apply the specific edit the EPUB describes
+                pass
 ```
 
 ### Recipe: Grade Validation (Labs)
@@ -446,10 +557,10 @@ ssh_tool.py lab finish <exercise>
 # 1. After completing student simulation, find verification steps
 # Look for sub_steps with is_verification: true in the instructions JSON
 
-# 2. Run verification commands — common patterns:
-ssh_tool.py run "ssh devops@servera 'cat /etc/motd'"
-ssh_tool.py run "ssh devops@serverb 'sudo systemctl status httpd'"
-ssh_tool.py run "curl -s http://servera.lab.example.com/"
+# 2. Run verification commands — common patterns (use actual hostnames from EPUB):
+ssh_tool.py run "ssh devops@<managed-host> 'cat /etc/motd'"
+ssh_tool.py run "ssh devops@<managed-host> 'sudo systemctl status httpd'"
+ssh_tool.py run "curl -s http://<managed-host>.<domain>/"
 
 # 3. Compare output with what the EPUB describes as expected
 # If verification fails after correct steps → P1 bug
@@ -460,8 +571,8 @@ ssh_tool.py run "curl -s http://servera.lab.example.com/"
 Interactive vault prompts hang in automation. Rewrite to non-interactive form:
 
 ```bash
-# Write the vault password to a temp file first
-ssh_tool.py write-file /tmp/vault-pass --content "$(echo -n 'redhat' | base64 -w0)"
+# Write the vault password to a temp file (use the password from the EPUB instructions)
+ssh_tool.py write-file /tmp/vault-pass --content "$(echo -n '<vault-password>' | base64 -w0)"
 
 # Encrypt a file
 ssh_tool.py run "ansible-vault encrypt --vault-password-file /tmp/vault-pass playbook.yml"
@@ -507,6 +618,7 @@ Analyze the quality of EPUB instructions:
 3. **Clarity**: Steps should be unambiguous. If a step could be interpreted multiple ways: **P3 bug**
 4. **Ordering**: Steps should be in a logical order. If step N references something created in step N+2: **P2 bug**
 5. **Consistency**: File names, variable names, and host names should be consistent throughout the exercise: **P3 bug**
+6. **`...output omitted...` in file content**: EPUBs often truncate long file listings or playbook output with `...output omitted...`. This is normal rendering — evaluate whether the student has enough information to complete the step WITHOUT seeing the omitted content. If the omitted section contains content the student needs to type or understand: **P2 bug** (incomplete instructions). If the omitted section is unchanged boilerplate (e.g., a tasks section the student doesn't modify): **not a bug** — note it as a finding.
 
 #### TC-SECURITY: Security Review
 
@@ -538,22 +650,24 @@ Verify alignment between EPUB instructions, solution files, and grading scripts:
 **Applies to:** All exercises. **Phase:** 1.
 
 1. Run `ssh_tool.py lab start <exercise>`
-2. If start fails due to blocking lab, ssh_tool handles it automatically (finishes blocking lab, retries)
-3. If start has FAIL in output, report as P0 bug
+2. If start fails due to a blocking lab, ssh_tool auto-recovers (finishes blocking lab or resets status, then retries)
+3. If `success` is false in the tool output, report as P0 bug (the tool detects failures using multiple heuristics — not tied to a single keyword)
 4. Verify SSH connectivity to all managed hosts the exercise uses (check the course profile's `real_hosts`)
 
 #### TC-GRADE: Grading (Labs Only)
 
 **Applies to:** Labs only. **Phase:** 1 (integrated into student simulation cycle).
 
-**Critical: DynoLabs grading exit codes do NOT indicate pass/fail of checks.** See `.skilldata/docs/dynolabs-grading.md`.
+**Critical: Lab CLI exit codes do NOT indicate pass/fail of individual checks.** The exit code only tells you whether the grading script ran without crashing. To determine which checks passed or failed, you must examine the output.
+
+The `ssh_tool.py lab grade` command attempts to parse the output into structured `checks` (each with `result` and `description`). It supports multiple output formats automatically. **If parsing finds no checks** (e.g., the output format changed), the raw `stdout` is always included — read it directly and interpret the results yourself.
 
 **Pre-check** (after lab start, before any work):
 ```bash
 ssh_tool.py lab grade <exercise>
 ```
-- Exit code 0 is normal (script completed)
-- Parse output for PASS/FAIL indicators
+- Check the `checks` array in the output for structured results
+- If `checks` is empty, read `stdout` directly — the output format may have changed
 - Analyze each check individually: most should fail, but some may legitimately pass if `lab start` pre-configures resources that grading also checks (e.g., installing packages, enabling services). This is a grading weakness, not a false positive.
 - If ALL checks pass: **P1 FALSE POSITIVE bug** (grading doesn't validate anything)
 - If checks pass that correspond to student-created artifacts (inventory files, playbook-applied config): **P1 FALSE POSITIVE bug** for those specific checks
@@ -563,7 +677,7 @@ ssh_tool.py lab grade <exercise>
 ```bash
 ssh_tool.py lab grade <exercise>
 ```
-- Exit code must be 0 (non-zero = P0 script crash)
+- Non-zero exit code with no output = P0 script crash
 - All checks SHOULD pass
 - If any check fails: **P1 FALSE NEGATIVE bug** (grading rejects correct solution)
 
@@ -575,7 +689,18 @@ ssh_tool.py lab grade <exercise>
 
 **This is the core test.** Execute the exercise as a student would, step by step.
 
-**Read the whole exercise first.** Before executing anything, get the full instructions with `epub_tool.py instructions` and read through all steps. Understand what files need to be created, what config needs to be edited, and what the exercise is trying to teach. This context is critical for making decisions during execution.
+**Understand the exercise before executing anything.** This is the most important step. Before running a single command:
+
+1. **Read the full instructions** with `epub_tool.py instructions` — read through ALL steps, not just the first few. Understand the complete arc: what gets created, what gets configured, what the expected outcome is.
+
+2. **Understand the teaching intent.** Course developers design exercises to teach specific concepts. Sometimes this means:
+   - **Intentional errors** — an exercise may deliberately introduce broken configs, wrong hostnames, or failing playbooks so the student learns to diagnose and fix them. These are NOT bugs. The EPUB will describe what's broken and guide the student to fix it.
+   - **Progressive disclosure** — earlier steps may produce incomplete or failing results that later steps build on. A failure at step 3 is only a bug if the EPUB doesn't expect it.
+   - **Implied knowledge** — chapter 8 assumes completion of chapters 1-7. Credentials, URLs, and conventions introduced in earlier chapters won't be re-explained. Check the course profile's `progressive_exercises` flag and the EPUB's lecture content for context.
+
+3. **Extract all URLs, hostnames, and ports** from the instructions' commands and prose (e.g., `https://aap.lab.example.com`, `utility.lab.example.com:3000`). Use these exact values — never substitute hostnames or ports from prior exercises or session memory. The EPUB is the single source of truth.
+
+4. **Identify the exercise pattern**: Is this a build-from-scratch exercise? A troubleshooting exercise with intentional failures? A review lab that combines skills from the whole chapter? This determines how to interpret failures during execution.
 
 Then execute step by step:
 
@@ -616,6 +741,11 @@ Then execute step by step:
 | "Take screenshot" | `web_tool.py screenshot /tmp/screenshot.png` |
 | "Navigate to VM list" | `web_tool.py navigate "https://console.../k8s/ns/<project>/kubevirt.io~v1~VirtualMachine"` |
 | AAP Controller UI actions | `rht-labs-aapcli` or Controller REST API via `web_tool.py api-get/api-post` |
+| "Create credential" (AAP UI) | `curl -sk -u <user>:<pass> -X POST -H 'Content-Type: application/json' '<aap-url>/api/controller/v2/credentials/' -d '{"name":"...","credential_type":<id>,"organization":1,"inputs":{...}}'` |
+| "Associate credential with JT" (AAP UI) | `curl -sk -u <user>:<pass> -X POST '<aap-url>/api/controller/v2/job_templates/<jt-id>/credentials/' -d '{"id":<cred-id>}'` |
+| "Launch template" (AAP UI) | `curl -sk -u <user>:<pass> -X POST '<aap-url>/api/controller/v2/job_templates/<jt-id>/launch/'` — then poll job status until completed |
+| "podman login" (interactive) | `ssh_tool.py run "podman login -u <user> -p <pass> <registry> --tls-verify=false"` |
+| "podman pull" | `ssh_tool.py run "podman pull --tls-verify=false <registry>/<image>:<tag>"` |
 | OCP web console: Add disk to VM | `oc` create PVC + `virtctl addvolume` + restart VM |
 | OCP web console: Create project | `oc new-project <name>` |
 | OCP web console: Check resource status | `oc get <resource> -n <project>` |
@@ -624,9 +754,10 @@ Then execute step by step:
 
 **Network device commands:** For courses with Cisco, Juniper, or Arista devices, use 2x timeout multipliers. Network device SSH sessions are slower and may need `pexpect` for interactive prompts.
 
-**Interpreting failures:** Not all command failures are bugs:
+**Interpreting failures — context is everything.** Not all command failures are bugs. Before classifying any failure, ask: "Does the EPUB expect this to fail?"
+- **Intentional failures** — course developers deliberately introduce errors for teaching (wrong hostnames, broken configs, misconfigured services). The EPUB describes what's wrong and guides the student to fix it. These are the exercise working as designed, not bugs. Check `has_intentional_errors` and `exercises_with_deliberate_bugs` in the course profile, but also read the prose — not every intentional failure is flagged in the profile.
+- **Progressive steps** — a command may fail at step 3 because the fix isn't applied until step 5. Read ahead before reporting.
 - Verification steps may legitimately return non-zero
-- Troubleshooting exercises have *intentional* failures (check course profile for `has_intentional_errors` and `exercises_with_deliberate_bugs`)
 - EE image pull with "no space left on device" is an environment issue
 - `ansible-navigator` returning non-zero with `PLAY RECAP` means the playbook ran but had Ansible errors — read the output to determine if it's an exercise bug or expected behavior
 
@@ -681,11 +812,12 @@ For exercises that deploy web applications or use web consoles (OpenShift, AAP C
 
    With the tunnel active, use web_tool.py locally:
    ```bash
-   # Login and navigate to a page in one session (important: use the console URL, not the OAuth URL)
-   web_tool.py login "https://console-openshift-console.apps.ocp4.example.com" \
-     --username admin --password redhatocp \
-     --then "https://console-openshift-console.apps.ocp4.example.com/k8s/ns/<ns>/kubevirt.io~v1~VirtualMachine" \
-     --screenshot "/tmp/ocp.png"
+   # Login URL, credentials, and target URL come from the EPUB and course profile.
+   # These are EXAMPLES — do not use these values directly.
+   web_tool.py login "<console-url>" \
+     --username <admin-user> --password <admin-password> \
+     --then "<console-url>/k8s/ns/<ns>/kubevirt.io~v1~VirtualMachine" \
+     --screenshot "/tmp/console.png"
    ```
    The `login` command handles the full OAuth redirect chain in a single browser session. **Always use the console URL** (not the OAuth authorize URL) — the console redirects to OAuth automatically and maintains proper state.
 
@@ -700,14 +832,21 @@ For exercises that deploy web applications or use web consoles (OpenShift, AAP C
 **AAP Controller:**
 - Use `rht-labs-aapcli` at `~/git-repos/active/rht-labs-aapcli` for API operations
 - Or use `web_tool.py api-get/api-post` for direct REST API calls
-- Controller URL is typically `https://controller.example.com` or as specified in the exercise
+- Or use `curl -sk -u <admin-user>:<admin-password>` via `ssh_tool.py run` for direct REST API calls (credentials from the EPUB instructions)
+- **Always use the Controller URL from the EPUB instructions** — do not assume a hostname or port. Different exercises may use different URLs (e.g., `aap.lab.example.com` vs `controller.lab.example.com`, with or without non-standard ports). In AAP 2.5, `aap.lab.example.com` is typically the unified gateway that proxies to the controller backend.
+- **Resource IDs in the EPUB are examples** — EPUB commands often contain hardcoded IDs like `job_templates/11/launch/`. These are example values from the author's environment. The actual IDs are dynamically assigned at `lab start` time and will differ. Always discover IDs by querying the API by name first (e.g., `GET /job_templates/?name=Refresh%20Fact%20Cache`), then use the returned ID in subsequent calls. The EPUB typically instructs the student to find the ID first, then use it — follow that flow.
+- **AAP exercises are inherently slow** — `lab start` provisions many Controller resources (job templates, inventories, projects, credentials, teams, users, notifications) via the API. Expect 180-300s for start and 60-100s for finish. These are not bugs — they're the cost of Controller provisioning.
+- **Transient AAP failures are common** — HTTP 503 during `lab start` (controller still initializing), MODULE FAILURE creating users (API gateway not ready), and HTTP 500 on role assignments after repeated start/finish cycles. Retry once before classifying as a bug. These are transient platform issues, not exercise bugs.
 
 #### TC-CLEAN: Cleanup
 
 **Applies to:** All exercises. **Phase:** 1.
 
 1. Run `ssh_tool.py lab finish <exercise>`
-2. If finish has FAIL in output: **P1 cleanup bug**
+2. If `success` is false: check the reason in the output before classifying.
+   - **Resource not found (404)** on deletion — in progressive courses, finish scripts may try to clean up resources from other exercises in the same chapter (e.g., deleting a Gitea repo created in an earlier exercise). If the resource was never created in this exercise, a 404 on deletion is expected, not a P1 bug. Verify the re-start still works.
+   - **Resource in use** (e.g., "being used by running jobs") — the finish script tried to delete a resource while a background job is still running. This IS a P1 bug — the finish script should cancel running jobs first.
+   - **Actual failures** (playbook errors, connection issues) — **P1 cleanup bug**
 3. Verify cleanup completeness: run `ssh_tool.py lab start <exercise>` again
 4. If start fails after finish: **P1 incomplete cleanup**
 5. Check that cleanup removes ALL artifacts:
@@ -780,7 +919,24 @@ Validate that exercises don't depend on state from previous exercises.
 | **P1** | Validation broken | Grading false positive/negative, cleanup incomplete, solution files don't work, verification fails after correct steps | MUST FIX before release |
 | **P2** | Quality issue | Instruction step fails, unclear error messages, missing files, security anti-patterns | SHOULD FIX |
 | **P3** | Polish | Typos in output, minor style issues, naming inconsistencies | Optional fix |
-| **ENV** | Environment issue | Library version mismatch, wrong workstation image, cluster not ready, disk full | Not an exercise bug — document and skip |
+| **LAB** | Lab infrastructure issue | Slow lab start/finish, transient API failures, service not ready after provisioning, cleanup tries to delete non-existent resources, platform instability after repeated cycles | Not an exercise bug — report to lab/platform team |
+| **ENV** | Environment issue | Library version mismatch, wrong workstation image, cluster not ready, disk full | Not an exercise bug — report to operations/provisioning team |
+
+### Exercise Bugs vs Lab Issues vs Environment Issues
+
+These three categories are distinct and reported to different teams:
+
+- **Exercise bugs (P0-P3)**: Problems in the EPUB instructions, solution files, or grading scripts. The exercise content is wrong. Report to the **course developer**.
+- **Lab issues (LAB)**: Problems in the lab scripts (`start.yml`, `finish.yml`, `grade.py`) or lab infrastructure behavior that aren't content bugs but degrade the student experience. Examples:
+  - `lab start` takes 300s (student waits 5 minutes before they can begin)
+  - `lab finish` fails with 404 trying to delete resources from other exercises
+  - `lab finish` fails because it doesn't cancel running jobs before deleting templates
+  - `lab start` returns 503 on first attempt, succeeds on retry (service not ready)
+  - `lab grade` launches jobs that interfere with `lab finish`
+  - Grading checks pass trivially (5/13 checks pass before student does anything)
+  - Platform becomes unstable after repeated start/finish cycles
+  Report to the **lab script developer** or **platform team**.
+- **Environment issues (ENV)**: Problems with the test environment itself — wrong workstation image, packages not matching the EPUB version, cluster not provisioned correctly, disk full. These block testing but aren't actionable by course or lab developers. Report to **operations/provisioning**.
 
 **Severity Decision Tree:**
 1. Can the student complete the exercise? NO → **P0**
@@ -788,6 +944,8 @@ Validate that exercises don't depend on state from previous exercises.
 3. Can the student practice repeatedly (idempotency)? NO → **P1**
 4. Is the student experience good? NO → **P2**
 5. Any minor issues? YES → **P3**
+6. Is the lab script misbehaving (slow, fragile, over-aggressive cleanup)? YES → **LAB**
+7. Is the test environment itself broken? YES → **ENV**
 
 ## Quality Metrics
 
@@ -929,6 +1087,13 @@ Only include TC sections that apply to this exercise type. Omit sections for TCs
 | ID | Severity | Category | Description | Fix Recommendation | Component |
 |----|----------|----------|-------------|-------------------|-----------|
 
+## Lab Issues
+| ID | Category | Description | Impact | Recommendation |
+|----|----------|-------------|--------|----------------|
+
+## Findings (non-bugs)
+<Observations worth documenting but not actionable bugs — e.g., EPUB uses example IDs that differ from live environment, progressive exercise assumptions>
+
 ## Performance
 | Phase | Duration |
 |-------|----------|
@@ -957,15 +1122,16 @@ When testing a chapter or multiple exercises, generate a summary report after al
 
 ## Exercise Results
 
-| Exercise | Type | Result | Bugs | Duration |
-|----------|------|--------|------|----------|
-| exercise-1 | GE | PASS | 0 | 45s |
-| exercise-2 | GE | PASS | 1 P3 | 52s |
-| exercise-3 | Lab | FAIL | 1 P1 | 68s |
+| Exercise | Type | Result | Bugs | Lab Issues | Duration |
+|----------|------|--------|------|------------|----------|
+| exercise-1 | GE | PASS | 0 | 1 | 45s |
+| exercise-2 | GE | PASS | 1 P3 | 0 | 52s |
+| exercise-3 | Lab | FAIL | 1 P1 | 2 | 68s |
 
 ## Aggregate Metrics
 
 - Total bugs: N (P0: N, P1: N, P2: N, P3: N)
+- Total lab issues: N
 - Defect density: X.X bugs/exercise
 - Critical ratio: X%
 - Total test duration: Xs
@@ -976,9 +1142,17 @@ When testing a chapter or multiple exercises, generate a summary report after al
 | ID | Exercise | Severity | Description | Component |
 |----|----------|----------|-------------|-----------|
 
+## Lab Issues
+
+| ID | Exercise | Category | Description | Impact |
+|----|----------|----------|-------------|--------|
+
 ## Recommendations
 
-<Prioritized list of fixes needed before release>
+<Prioritized list of fixes needed before release, organized by:
+1. Exercise bugs (P0 first, then P1, P2, P3)
+2. Lab issues (report to lab/platform team)
+3. Environment issues (report to operations)>
 ```
 
 ## Utility Reference
@@ -1020,7 +1194,7 @@ The skill auto-detects 3 course patterns from `outline.yml`:
 - `outline.yml` has `course:` root key
 - Materials at `content/{chapter-keyword}/`
 
-### OpenShift / Kubernetes Courses (DO*)
+### OpenShift / Kubernetes Courses
 
 See `.skilldata/docs/ocp-recipes.md` for full OCP reference including VM disk operations, storage classes, web console testing with Playwright, dev container exercises, and ansible-navigator usage.
 
@@ -1052,11 +1226,11 @@ When blocked by an environment issue, report it as ENV in the summary and note t
 
 ## Decision Points
 
-- **Lab start fails with "another lab is running"**: ssh_tool handles this automatically by finishing the blocking lab
+- **Lab start fails due to blocking lab**: ssh_tool detects this using multiple heuristics (not tied to a specific error message format) and auto-recovers by finishing the blocking lab or resetting lab status. If auto-recovery fails, run `ssh_tool.py lab finish <exercise>` manually
 - **Command times out**: Retry once with 2x timeout. If still fails, record as P2 and continue
 - **SSH drops mid-test**: ssh_tool auto-reconnects on stale sockets. If that fails, run `ssh_tool.py connect` again
 - **Exercise not found in EPUB**: Check for fuzzy matches (the exercise ID in instructions may differ from what was requested)
-- **Grade passes without solution**: This is a P1 bug, not a false alarm. DynoLabs grading SHOULD fail when student hasn't done the work
+- **Grade passes without solution**: This is a P1 bug, not a false alarm. Grading SHOULD fail when the student hasn't done the work
 - **All steps pass but grade fails**: Check if solution files need to be applied differently, or if grading checks something the instructions don't cover
 - **AAP Controller web UI steps**: Use `rht-labs-aapcli` or Controller REST API via `web_tool.py api-get/api-post`
 - **Switching lessons in multi-repo course**: Must run `lab install <new-lesson>` (or `lab force <new-lesson>`) before testing exercises in a different lesson
@@ -1069,6 +1243,10 @@ When blocked by an environment issue, report it as ENV in the summary and note t
 - **OCP web console steps**: Prefer `oc` CLI equivalents for reliability. Use `web_tool.py` Playwright for visual verification and web-console-only workflows
 - **Network device exercises**: Apply 2x timeout multiplier for all SSH/device commands
 - **Troubleshooting exercise**: Check `exercises_with_deliberate_bugs` in profile — failures may be intentional
+- **Gitea webhook via API vs UI**: The Gitea web UI defaults `branch_filter` to `*`, but the API defaults it to empty string `""`. If grading checks for `branch_filter: *`, set it explicitly when creating webhooks via API: `"branch_filter": "*"`. This is a known API/UI behavior difference, not an exercise bug.
+- **Gitea API authentication**: If the Gitea password contains `@` (e.g., `Student@123`), `curl -u user:pass` fails because `@` breaks URL parsing. Use base64-encoded Basic auth instead: `curl -H 'Authorization: Basic <base64(user:pass)>'`. Alternatively, create a Gitea API token first (requires scope, e.g., `write:repository`) and use `curl -H 'Authorization: token <token>'`. The Gitea API base path is `/api/v1/`.
+- **AAP team membership verification**: In AAP 2.5, verifying team member/admin role assignments via the REST API is not straightforward — `access_list`, `role_team_assignments`, and `role_user_assignments` endpoints may return empty results. Verify by checking the **job output** (`/api/controller/v2/jobs/<id>/stdout/?format=txt`) instead, which clearly shows role assignments. Alternatively, list users directly and check their team associations.
+- **EPUB file content with `...output omitted...`**: When a `file_action` from the parsed EPUB contains `...output omitted...`, the content is truncated. Read the actual file from the workstation/repo first, then apply only the specific change the EPUB describes. The omitted content is typically unchanged boilerplate that the student doesn't need to modify.
 
 ## Lab CLI Reference
 

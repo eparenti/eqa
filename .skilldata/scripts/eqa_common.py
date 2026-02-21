@@ -2,12 +2,15 @@
 
 Provides common I/O helpers, cache directory management, state file I/O,
 a @json_safe decorator for consistent error handling, secret redaction,
-and config file loading.
+debug logging, and config file loading.
 """
 
 import functools
 import json
+import logging
+import logging.handlers
 import os
+import re
 import sys
 import traceback
 from pathlib import Path
@@ -17,20 +20,30 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 
 _secrets: set = set()
+_secret_re: re.Pattern | None = None
 
 
 def register_secrets(*values):
     """Register strings to be redacted from all JSON output."""
+    global _secret_re
+    changed = False
     for v in values:
         if v and isinstance(v, str) and len(v) >= 4:
-            _secrets.add(v)
+            if v not in _secrets:
+                _secrets.add(v)
+                changed = True
+    if changed:
+        # Recompile once per batch of new secrets.  Longest-first so
+        # "Student@123" is matched before "Student".
+        ordered = sorted(_secrets, key=len, reverse=True)
+        _secret_re = re.compile('|'.join(re.escape(s) for s in ordered))
 
 
 def _redact(text: str) -> str:
     """Replace registered secrets in a string with '***'."""
-    for s in _secrets:
-        text = text.replace(s, "***")
-    return text
+    if _secret_re is None:
+        return text
+    return _secret_re.sub('***', text)
 
 
 def _redact_data(obj):
@@ -45,13 +58,95 @@ def _redact_data(obj):
 
 
 def _output(data):
-    """Print JSON to stdout, redacting registered secrets."""
-    print(json.dumps(_redact_data(data), default=str))
+    """Print JSON to stdout (fd 1), redacting registered secrets.
+
+    Writes directly to fd 1 to bypass any sys.stdout redirection from
+    the stdout_guard context manager, ensuring clean JSON output even
+    if third-party libraries have written to sys.stdout.
+    """
+    line = json.dumps(_redact_data(data), default=str) + "\n"
+    os.write(1, line.encode())
+
+
+class stdout_guard:
+    """Context manager that redirects sys.stdout to sys.stderr.
+
+    Prevents third-party library stdout pollution from corrupting JSON
+    output.  The _output() function writes directly to fd 1, so it is
+    unaffected by this redirection.
+
+    Usage::
+
+        with stdout_guard():
+            # Any print() or sys.stdout.write() goes to stderr
+            do_work()
+        # _output({...}) still writes clean JSON to fd 1
+    """
+
+    def __enter__(self):
+        self._orig = sys.stdout
+        sys.stdout = sys.stderr
+        return self
+
+    def __exit__(self, *exc):
+        sys.stdout = self._orig
+        return False
 
 
 def _err(msg):
     """Print diagnostic message to stderr."""
     print(msg, file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
+# Debug log  (~/.cache/eqa/debug.log, rotating, 2 MB × 3 backups)
+# ---------------------------------------------------------------------------
+
+_debug_logger: logging.Logger | None = None
+
+
+def _get_debug_logger() -> logging.Logger:
+    """Lazily initialise and return the rotating debug logger."""
+    global _debug_logger
+    if _debug_logger is not None:
+        return _debug_logger
+
+    cache_dir = get_cache_dir()
+    log_path = os.path.join(cache_dir, "debug.log")
+
+    logger = logging.getLogger("eqa.debug")
+    logger.setLevel(logging.DEBUG)
+    logger.propagate = False          # don't leak to root / stderr
+
+    handler = logging.handlers.RotatingFileHandler(
+        log_path, maxBytes=2 * 1024 * 1024, backupCount=3,
+        encoding="utf-8",
+    )
+    handler.setFormatter(logging.Formatter(
+        "%(asctime)s %(levelname)-5s [%(caller)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    ))
+    logger.addHandler(handler)
+
+    _debug_logger = logger
+    return logger
+
+
+def debug_log(msg: str, *, level: int = logging.DEBUG, caller: str = ""):
+    """Append a redacted message to the rotating debug log.
+
+    Parameters
+    ----------
+    msg : str
+        Free-form message.  Registered secrets are redacted before writing.
+    level : int
+        Logging level (default DEBUG).
+    caller : str
+        Short label for the calling tool (e.g. "ssh", "epub").  Shown in
+        the ``[caller]`` field of each log line.
+    """
+    logger = _get_debug_logger()
+    logger.log(level, _redact(msg), extra={"caller": caller or "eqa"})
 
 
 def get_cache_dir():
@@ -141,14 +236,19 @@ def load_config() -> dict:
 
 
 def json_safe(func):
-    """Decorator: catch unhandled exceptions, output JSON error, traceback to stderr."""
+    """Decorator: catch unhandled exceptions, output JSON error, traceback to stderr.
+
+    Also wraps execution in stdout_guard so that any stray print()
+    calls from dependencies go to stderr instead of corrupting JSON.
+    """
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
-        try:
-            return func(*args, **kwargs)
-        except SystemExit:
-            raise
-        except Exception as e:
-            traceback.print_exc(file=sys.stderr)
-            _output({"success": False, "error": f"Unhandled error: {e}"})
+        with stdout_guard():
+            try:
+                return func(*args, **kwargs)
+            except SystemExit:
+                raise
+            except Exception as e:
+                traceback.print_exc(file=sys.stderr)
+                _output({"success": False, "error": f"Unhandled error: {e}"})
     return wrapper

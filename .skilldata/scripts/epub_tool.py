@@ -58,12 +58,22 @@ def _epub_cache_dir(epub_path: str) -> str:
     return cache_dir
 
 
+_exercise_map_cache = {}
+
+
 def _build_exercise_map(content_path):
     """Parse all HTML files once. Returns {exercise_id: {section, chapter_file, type, title}}.
 
     Consolidates the glob+parse+search loop that was previously duplicated
     in _find_exercises(), cmd_instructions(), and cmd_summary().
+
+    Results are cached in-memory keyed by content_path to avoid re-parsing
+    within the same process invocation.
     """
+    content_key = str(content_path)
+    if content_key in _exercise_map_cache:
+        return _exercise_map_cache[content_key]
+
     _ensure_bs4()
 
     exercise_map = {}
@@ -114,6 +124,7 @@ def _build_exercise_map(content_path):
         except Exception as e:
             _err(f"Warning: Error parsing {html_file.name}: {e}")
 
+    _exercise_map_cache[content_key] = exercise_map
     return exercise_map
 
 

@@ -28,7 +28,7 @@ import sys
 import time
 import uuid
 
-from eqa_common import _output, _err, get_cache_dir, get_state_path, load_state, save_state, json_safe
+from eqa_common import _output, _err, get_cache_dir, get_state_path, load_state, save_state, json_safe, debug_log
 
 
 STATE_FILE = get_state_path("ssh")
@@ -43,7 +43,7 @@ def _strip_ansi(text: str, strip_spinners: bool = True) -> str:
             and collapse empty lines. Set to False for VM command output
             where all content should be preserved.
     """
-    text = re.sub(r'\x1b\[[0-9;?]*[A-Za-z]', '', text)  # CSI sequences (including ?2004h/l)
+    text = re.sub(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])', '', text)  # ECMA-48 Fe + CSI sequences
     text = re.sub(r'\x1b\][^\x07]*\x07', '', text)       # OSC sequences
     text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', text)  # control chars
     text = text.replace('\r\n', '\n').replace('\r', '\n')  # normalize line endings
@@ -51,20 +51,40 @@ def _strip_ansi(text: str, strip_spinners: bool = True) -> str:
     if not strip_spinners:
         return text
 
-    # Strip DynoLabs spinner lines (e.g., "   -    Checking lab systems")
-    # These are progress indicator lines with a single spinner char (- \ /)
-    # followed by 4+ spaces. Exclude | to avoid matching MySQL table output.
+    # Collapse DynoLabs progress/spinner lines. These repeat the same
+    # message with different leading indicator characters (e.g., - \ / |)
+    # before a final result line (SUCCESS/FAIL/WARNING + same message).
+    #
+    # Instead of matching specific spinner chars (brittle — breaks if
+    # DynoLabs changes), we deduplicate by message content: strip the
+    # leading indicator prefix and any result keyword to get the core
+    # message, then keep only the LAST line in each consecutive run
+    # of identical messages. This naturally keeps the SUCCESS/FAIL line
+    # and drops all the spinner repetitions before it.
+    _RESULT_PREFIX = re.compile(r'^(?:SUCCESS|FAIL|WARNING)\s+', re.IGNORECASE)
+
     lines = text.split('\n')
     filtered = []
+    prev_core = None
+    prev_line = None
     for line in lines:
         stripped = line.strip()
-        # Skip spinner lines: single spinner char (not |) + 4 spaces + text
-        if re.match(r'^[-\\/]\s{4}', stripped):
-            continue
-        # Skip empty lines that result from spinner removal
         if not stripped:
             continue
-        filtered.append(line)
+        # Extract core message: strip leading non-alnum (spinner char),
+        # then strip result prefix (SUCCESS/FAIL/WARNING)
+        msg = re.sub(r'^[^a-zA-Z0-9]*', '', stripped)
+        core = _RESULT_PREFIX.sub('', msg)
+        if core == prev_core and prev_core:
+            # Same core message — replace with this line (keep last)
+            prev_line = line
+        else:
+            if prev_line is not None:
+                filtered.append(prev_line)
+            prev_core = core
+            prev_line = line
+    if prev_line is not None:
+        filtered.append(prev_line)
     return '\n'.join(filtered)
 
 
@@ -80,6 +100,7 @@ def _ssh_opts(state: dict) -> list:
 
 def _ssh_exec(state, cmd, timeout=120, input_data=None):
     """Run command over SSH. Returns (success, stdout, stderr, rc, duration)."""
+    debug_log(f"exec cmd={cmd!r} timeout={timeout}", caller="ssh")
     start_time = time.time()
     try:
         result = subprocess.run(
@@ -88,18 +109,29 @@ def _ssh_exec(state, cmd, timeout=120, input_data=None):
             input=input_data,
         )
         duration = time.time() - start_time
+        stdout_clean = _strip_ansi(result.stdout)
+        stderr_clean = _strip_ansi(result.stderr)
+        debug_log(
+            f"exec rc={result.returncode} duration={duration:.2f}s"
+            f" stdout={stdout_clean[:500]!r}"
+            f" stderr={stderr_clean[:200]!r}",
+            caller="ssh",
+        )
         return (
             result.returncode == 0,
-            _strip_ansi(result.stdout),
-            _strip_ansi(result.stderr),
+            stdout_clean,
+            stderr_clean,
             result.returncode,
             round(duration, 2),
         )
     except subprocess.TimeoutExpired:
         duration = time.time() - start_time
+        debug_log(f"exec TIMEOUT after {timeout}s cmd={cmd!r}", caller="ssh",
+                  level=40)  # WARNING
         return (False, "", f"Command timed out after {timeout}s", -1, round(duration, 2))
     except Exception as e:
         duration = time.time() - start_time
+        debug_log(f"exec ERROR {e} cmd={cmd!r}", caller="ssh", level=40)
         return (False, "", f"Execution error: {e}", -1, round(duration, 2))
 
 
@@ -115,14 +147,48 @@ def requires_connection(func):
     return wrapper
 
 
+def _resolve_ssh_config_files(config_path: str) -> list:
+    """Resolve SSH config files, following Include directives.
+
+    Returns a list of file paths to parse, in order. Handles glob
+    patterns in Include directives (e.g., Include config.d/*).
+    """
+    import glob as globmod
+
+    config_path = os.path.expanduser(config_path)
+    if not os.path.exists(config_path):
+        return []
+
+    files = [config_path]
+    try:
+        with open(config_path) as f:
+            for line in f:
+                stripped = line.strip()
+                if stripped.lower().startswith('include '):
+                    pattern = stripped.split(None, 1)[1].strip()
+                    # Relative paths are relative to ~/.ssh/
+                    if not os.path.isabs(pattern):
+                        pattern = os.path.join(os.path.dirname(config_path), pattern)
+                    pattern = os.path.expanduser(pattern)
+                    for match in sorted(globmod.glob(pattern)):
+                        if os.path.isfile(match) and match not in files:
+                            files.append(match)
+    except Exception:
+        pass
+
+    return files
+
+
 def _detect_workstation() -> str:
     """Auto-detect workstation hostname from ~/.ssh/config.
 
     Looks for hosts named 'workstation', or containing 'workstation' in
-    their hostname. Falls back to 'workstation' if not found.
+    their hostname. Follows Include directives to find hosts defined in
+    included config files. Falls back to 'workstation' if not found.
     """
     config_path = os.path.expanduser("~/.ssh/config")
-    if not os.path.exists(config_path):
+    config_files = _resolve_ssh_config_files(config_path)
+    if not config_files:
         return "workstation"
 
     try:
@@ -130,22 +196,27 @@ def _detect_workstation() -> str:
         current_hostname = None
         candidates = []
 
-        for path in [config_path]:
-            with open(path) as f:
-                for line in f:
-                    line = line.strip()
-                    if not line or line.startswith('#'):
-                        continue
-                    if line.lower().startswith('host '):
-                        if current_host and 'workstation' in current_host.lower():
-                            candidates.append((current_host, current_hostname or current_host))
-                        current_host = line.split(None, 1)[1].split()[0]
+        for path in config_files:
+            try:
+                with open(path) as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line or line.startswith('#'):
+                            continue
+                        if line.lower().startswith('host '):
+                            if current_host and 'workstation' in current_host.lower():
+                                candidates.append((current_host, current_hostname or current_host))
+                            current_host = line.split(None, 1)[1].split()[0]
+                            current_hostname = None
+                        elif line.lower().startswith('hostname '):
+                            current_hostname = line.split(None, 1)[1]
+                    # Handle last entry in this file
+                    if current_host and 'workstation' in current_host.lower():
+                        candidates.append((current_host, current_hostname or current_host))
+                        current_host = None
                         current_hostname = None
-                    elif line.lower().startswith('hostname '):
-                        current_hostname = line.split(None, 1)[1]
-                # Handle last entry
-                if current_host and 'workstation' in current_host.lower():
-                    candidates.append((current_host, current_hostname or current_host))
+            except (IOError, OSError):
+                continue
 
         if candidates:
             # Prefer exact match "workstation" over partial matches
@@ -190,7 +261,13 @@ def _get_subnets(state):
 
 
 def _detect_framework(state: dict) -> tuple:
-    """Detect which lab framework is available."""
+    """Detect which lab framework is available.
+
+    Uses a series of probes to identify the framework.  Each probe is
+    independent — if one detection method stops working, others still
+    function.  The command prefix is always 'lab' unless the only
+    grading mechanism found is a uv-based Python package.
+    """
     host = state["host"]
     opts = _ssh_opts(state)
 
@@ -204,31 +281,41 @@ def _detect_framework(state: dict) -> tuple:
         except Exception:
             return False, ""
 
-    # Check for standard lab command
+    # Probe 1: Is there a `lab` command in PATH?
     ok, stdout = ssh_run("which lab 2>/dev/null")
     if ok and stdout.strip():
         lab_path = stdout.strip()
 
-        # Check if it's Rust CLI (ELF binary)
+        # Sub-probe: binary type (informational — doesn't gate functionality)
         ok, file_type = ssh_run(f"file {lab_path} 2>/dev/null")
         file_type_lower = file_type.lower() if ok else ""
+        is_binary = 'elf' in file_type_lower or 'executable' in file_type_lower
+        is_script = 'script' in file_type_lower or 'text' in file_type_lower
 
-        if 'elf' in file_type_lower or 'executable' in file_type_lower:
-            ok, help_out = ssh_run("lab --help 2>/dev/null | grep -q autotest && echo 'rust'")
-            if ok and 'rust' in help_out:
-                return ('dynolabs5-rust', 'lab')
+        # Sub-probe: ask `lab` for its version/capabilities
+        # Try multiple detection methods — any one succeeding is enough
+        framework_name = 'dynolabs'
+        ok_ver, ver_out = ssh_run("lab --version 2>&1")
+        if ok_ver and ver_out.strip():
+            _err(f"Lab CLI version: {ver_out.strip()}")
 
-        if 'script' in file_type_lower or 'text' in file_type_lower:
-            return ('wrapper', 'lab')
+        if is_binary:
+            # Compiled binary — likely Rust CLI (DynoLabs 5+)
+            framework_name = 'dynolabs5-rust'
+        elif is_script:
+            framework_name = 'wrapper'
 
-        return ('dynolabs', 'lab')
+        # Regardless of detection confidence, the prefix is always 'lab'
+        return (framework_name, 'lab')
 
-    # Check for DynoLabs 5 Python grading (uv-based)
+    # Probe 2: uv-based Python grading (no `lab` binary in PATH)
     ok_uv, _ = ssh_run("which uv 2>/dev/null")
-    ok_grading, grading_out = ssh_run("test -f ~/grading/pyproject.toml && echo 'exists'")
-    if ok_uv and ok_grading and 'exists' in grading_out:
-        return ('dynolabs5-python', 'cd ~/grading && uv run lab')
+    for grading_dir in ['~/grading', '~/.grading']:
+        ok_g, g_out = ssh_run(f"test -f {grading_dir}/pyproject.toml && echo 'exists'")
+        if ok_uv and ok_g and 'exists' in g_out:
+            return ('dynolabs5-python', f'cd {grading_dir} && uv run lab')
 
+    # Probe 3: nothing found — return unknown, still try 'lab' as prefix
     return ('unknown', 'lab')
 
 
@@ -247,6 +334,7 @@ def cmd_connect(args):
             os.unlink(old_socket)
 
     _err(f"Connecting to {host}...")
+    debug_log(f"connect host={host} control_path={control_path}", caller="ssh")
 
     max_retries = 3
     for attempt in range(max_retries):
@@ -300,6 +388,8 @@ def cmd_connect(args):
     state["framework_prefix"] = prefix
 
     save_state(STATE_FILE, state)
+    debug_log(f"connected host={host} framework={framework} prefix={prefix!r}",
+              caller="ssh")
 
     _output({
         "success": True,
@@ -429,6 +519,87 @@ def cmd_run(args):
     })
 
 
+def _detect_blocking_lab(output: str) -> str | None:
+    """Try to extract a blocking exercise name from lab output.
+
+    Uses multiple heuristics so that a single format change doesn't
+    break auto-recovery.  Returns the exercise name or None.
+    """
+    # Heuristic 1: message says "lab finish <name>"
+    m = re.search(r'lab finish\s+(\S+)', output)
+    if m:
+        return m.group(1)
+    # Heuristic 2: message says "finish <name> first" or similar
+    m = re.search(r'finish\s+["\']?(\S+?)["\']?\s+first', output, re.IGNORECASE)
+    if m:
+        return m.group(1)
+    # Heuristic 3: any mention of "already running/active" + an exercise name
+    if re.search(r'already\s+(running|active|in progress)', output, re.IGNORECASE):
+        # Return None — we know it's blocked but can't extract the name.
+        # Caller can try `lab status --reset` or ask the user.
+        return ""
+    return None
+
+
+def _detect_failure(stdout: str) -> bool:
+    """Check whether lab start/finish output indicates a failure.
+
+    Uses multiple heuristics so the tool degrades gracefully if the
+    output format changes.
+    """
+    for pattern in [
+        r'\bFAIL\b',          # DynoLabs 5 current format
+        r'\bFAILED\b',        # possible variant
+        r'\bERROR\b',         # generic error keyword
+        r'\u2718',            # ✘ cross mark
+        r'\u274C',            # ❌ red X
+    ]:
+        if re.search(pattern, stdout):
+            return True
+    return False
+
+
+def _parse_grade_checks(stdout: str) -> list:
+    """Parse grade output into structured check results.
+
+    Tries multiple output formats so that format changes don't silently
+    break grading validation.  Always returns a list (possibly empty if
+    no known format matched — caller should fall back to raw stdout).
+    """
+    checks = []
+
+    # Format 1: "PASS  description" / "FAIL  description" (current DynoLabs)
+    for line in stdout.split('\n'):
+        m = re.match(r'\s*(PASS|FAIL)\s+(.+)', line)
+        if m:
+            checks.append({"result": m.group(1), "description": m.group(2).strip()})
+
+    if checks:
+        return checks
+
+    # Format 2: checkmark/cross symbols — "✓ description" / "✗ description"
+    for line in stdout.split('\n'):
+        m = re.match(r'\s*([\u2713\u2714\u2705])\s+(.+)', line)
+        if m:
+            checks.append({"result": "PASS", "description": m.group(2).strip()})
+            continue
+        m = re.match(r'\s*([\u2717\u2718\u274C])\s+(.+)', line)
+        if m:
+            checks.append({"result": "FAIL", "description": m.group(2).strip()})
+
+    if checks:
+        return checks
+
+    # Format 3: "[OK] description" / "[FAIL] description"
+    for line in stdout.split('\n'):
+        m = re.match(r'\s*\[(OK|PASS|FAIL|ERROR)\]\s+(.+)', line, re.IGNORECASE)
+        if m:
+            result = "PASS" if m.group(1).upper() in ("OK", "PASS") else "FAIL"
+            checks.append({"result": result, "description": m.group(2).strip()})
+
+    return checks
+
+
 @json_safe
 @requires_connection
 def cmd_lab(args, state):
@@ -446,6 +617,8 @@ def cmd_lab(args, state):
         lab_name = exercise
         cmd = f"{prefix} {action} {shlex.quote(lab_name)}"
     _err(f"Running: {cmd} (framework: {framework})")
+    debug_log(f"lab {action} {exercise} framework={framework} cmd={cmd!r}",
+              caller="ssh")
 
     ok, stdout, stderr, rc, duration = _ssh_exec(state, cmd, timeout=timeout)
     success = ok
@@ -453,18 +626,22 @@ def cmd_lab(args, state):
     # If lab start fails or warns about a blocking lab, finish it and retry.
     if action == 'start':
         output = stdout + stderr
-        match = re.search(r'lab finish\s+(\S+)', output)
-        if match:
-            blocking_lab = match.group(1)
-            _err(f"Finishing blocking lab: {blocking_lab}")
-            _ssh_exec(state, f"{prefix} finish {shlex.quote(blocking_lab)}", timeout=120)
+        blocking = _detect_blocking_lab(output)
+        if blocking is not None:
+            if blocking:
+                _err(f"Finishing blocking lab: {blocking}")
+                _ssh_exec(state, f"{prefix} finish {shlex.quote(blocking)}", timeout=120)
+            else:
+                # Blocked but can't extract name — try status reset
+                _err("Blocked by another lab (name unknown), attempting status reset")
+                _ssh_exec(state, f"{prefix} status --reset", timeout=30)
             _err(f"Retrying: {cmd}")
             ok, stdout, stderr, rc, duration = _ssh_exec(state, cmd, timeout=timeout)
             success = ok
 
-    # Check stdout for FAIL indicators (start/finish only)
+    # Check stdout for failure indicators (start/finish only)
     if success and action in ('start', 'finish'):
-        if re.search(r'\bFAIL\b', stdout):
+        if _detect_failure(stdout):
             success = False
 
     output_data = {
@@ -477,16 +654,21 @@ def cmd_lab(args, state):
         "command": cmd,
     }
 
-    # Parse grade check results for structured output
+    # Parse grade check results for structured output.
+    # Always includes raw stdout so the agent can interpret if parsing
+    # finds nothing (e.g., if the output format changed).
     if action == 'grade':
-        checks = []
-        for line in stdout.split('\n'):
-            m = re.match(r'\s*(PASS|FAIL)\s+(.+)', line)
-            if m:
-                checks.append({"result": m.group(1), "description": m.group(2).strip()})
+        checks = _parse_grade_checks(stdout)
         output_data["checks"] = checks
         output_data["all_pass"] = all(c["result"] == "PASS" for c in checks) if checks else None
         output_data["all_fail"] = all(c["result"] == "FAIL" for c in checks) if checks else None
+        debug_log(f"grade parsed {len(checks)} checks all_pass={output_data['all_pass']}",
+                  caller="ssh")
+        if not checks:
+            _err("Warning: Could not parse grade output into structured checks. "
+                 "The output format may have changed. Raw stdout is included.")
+            debug_log(f"grade parse EMPTY — raw stdout: {stdout[:500]!r}",
+                      caller="ssh", level=30)
 
     _output(output_data)
 
@@ -494,7 +676,13 @@ def cmd_lab(args, state):
 @json_safe
 @requires_connection
 def cmd_interactive(args, state):
-    """Execute interactive command via pexpect."""
+    """Execute interactive command via pexpect.
+
+    Prompts are matched in any order — the command watches for all
+    prompt patterns simultaneously and responds to whichever appears.
+    This handles dynamic ordering, optional prompts, and unexpected
+    system messages that appear between prompts.
+    """
     try:
         import pexpect
     except ImportError:
@@ -505,8 +693,12 @@ def cmd_interactive(args, state):
     timeout = args.timeout
     prompts = json.loads(args.prompts)  # [[pattern, response], ...]
 
+    debug_log(f"interactive cmd={command!r} prompts={len(prompts)} timeout={timeout}",
+              caller="ssh")
+
     start_time = time.time()
     output_buffer = []
+    matched_prompts = []
 
     try:
         ssh_cmd = (f"ssh -o ControlPath={state['control_path']} "
@@ -514,16 +706,52 @@ def cmd_interactive(args, state):
                    f"{state['host']} {command}")
         child = pexpect.spawn(ssh_cmd, timeout=timeout, encoding='utf-8')
 
-        for prompt_pattern, response in prompts:
-            child.expect(prompt_pattern)
+        # Build pattern list: all prompt patterns + EOF + TIMEOUT
+        patterns = [p[0] for p in prompts]
+        sentinel_eof = len(patterns)
+        sentinel_timeout = len(patterns) + 1
+        expect_list = patterns + [pexpect.EOF, pexpect.TIMEOUT]
+
+        # Track which prompts have been answered (allow repeats for
+        # prompts like "Confirm vault password" that appear twice)
+        max_iterations = len(prompts) * 3  # safety cap
+        iterations = 0
+
+        while iterations < max_iterations:
+            iterations += 1
+            idx = child.expect(expect_list)
+
             output_buffer.append(child.before or "")
-            output_buffer.append(child.after or "")
-            child.sendline(response)
 
-        child.expect(pexpect.EOF)
-        output_buffer.append(child.before or "")
+            if idx == sentinel_eof:
+                debug_log("interactive: EOF reached", caller="ssh")
+                break
+            elif idx == sentinel_timeout:
+                debug_log(
+                    f"interactive TIMEOUT after {timeout}s."
+                    f" before={child.before!r} matched_so_far={matched_prompts}",
+                    caller="ssh", level=40,
+                )
+                _output({
+                    "success": False,
+                    "return_code": -1,
+                    "stdout": "".join(output_buffer),
+                    "stderr": f"Interactive command timed out after {timeout}s",
+                    "duration": round(time.time() - start_time, 2),
+                    "matched_prompts": matched_prompts,
+                })
+                return
+            else:
+                # Matched a prompt — send the corresponding response
+                output_buffer.append(child.after or "")
+                prompt_pattern = prompts[idx][0]
+                response = prompts[idx][1]
+                matched_prompts.append(prompt_pattern)
+                debug_log(f"interactive: matched {prompt_pattern!r}, sending response",
+                          caller="ssh")
+                child.sendline(response)
+
         child.close()
-
         duration = time.time() - start_time
         exit_code = child.exitstatus or 0
 
@@ -533,22 +761,16 @@ def cmd_interactive(args, state):
             "stdout": "".join(output_buffer),
             "stderr": "",
             "duration": round(duration, 2),
-        })
-    except pexpect.TIMEOUT:
-        _output({
-            "success": False,
-            "return_code": -1,
-            "stdout": "".join(output_buffer),
-            "stderr": f"Interactive command timed out after {timeout}s",
-            "duration": timeout,
+            "matched_prompts": matched_prompts,
         })
     except pexpect.EOF:
         _output({
             "success": False,
             "return_code": -1,
             "stdout": "".join(output_buffer),
-            "stderr": "Command ended before all prompts were handled",
+            "stderr": "Command ended unexpectedly",
             "duration": round(time.time() - start_time, 2),
+            "matched_prompts": matched_prompts,
         })
     except Exception as e:
         _output({
@@ -557,6 +779,7 @@ def cmd_interactive(args, state):
             "stdout": "".join(output_buffer),
             "stderr": f"Interactive execution error: {e}",
             "duration": round(time.time() - start_time, 2),
+            "matched_prompts": matched_prompts,
         })
 
 
@@ -642,6 +865,8 @@ def cmd_vm_exec(args, state):
     password = args.password
     timeout = args.timeout
 
+    debug_log(f"vm-exec vm={vm_name} ns={namespace} user={user} cmd={command!r}",
+              caller="ssh")
     start_time = time.time()
 
     # Strategy 1: virtctl ssh (key-based auth)
@@ -715,7 +940,7 @@ def cmd_vm_exec(args, state):
 
         # At shell prompt — run the command with exit code marker
         marker = f"EQA_EXIT_{uuid.uuid4().hex}"
-        child.sendline(f"{command}; echo {marker}=$?")
+        child.sendline(f"{command}; echo; echo {marker}=$?")
         child.expect(f'{marker}=(\\d+)', timeout=timeout)
         output_buffer.append(child.before or "")
         exit_code = int(child.match.group(1))
