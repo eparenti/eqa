@@ -50,7 +50,7 @@ def _resolve_chapter(input_str: str, chapter_num: int) -> dict:
     except Exception as e:
         return {"success": False, "error": f"Failed to parse outline.yml: {e}"}
 
-    root = outline.get('course', outline.get('lesson', {}))
+    root = outline.get('course', outline.get('lesson', outline.get('dco', {})))
     chapters = root.get('chapters', [])
 
     is_multi_repo = any(ch.get('repository') for ch in chapters)
@@ -107,17 +107,7 @@ def _resolve_chapter(input_str: str, chapter_num: int) -> dict:
         if not epub:
             return {"success": False, "error": f"No EPUB found in {course_dir}"}
 
-        # Use course code from metadata.yml if available, otherwise directory name
-        course_code = course_dir.name.lower()
-        metadata_path = course_dir / "metadata.yml"
-        if metadata_path.exists():
-            try:
-                with open(metadata_path) as f:
-                    meta = yaml.safe_load(f)
-                    if meta and 'code' in meta:
-                        course_code = meta['code'].lower()
-            except Exception:
-                pass
+        course_code = _extract_lesson_code(course_dir)
 
         return {
             "success": True,
@@ -145,18 +135,15 @@ def _resolve_input(input_str: str) -> dict:
     # Directory
     if input_path.is_dir():
         epub = find_epub(input_path)
+        if not epub:
+            epub = _try_build_epub(input_path)
         if epub:
+            lesson_code = _extract_lesson_code(input_path)
             return {
                 "success": True,
                 "epub_path": str(epub),
                 "lesson_path": str(input_path),
-            }
-        epub = _try_build_epub(input_path)
-        if epub:
-            return {
-                "success": True,
-                "epub_path": str(epub),
-                "lesson_path": str(input_path),
+                "lesson_code": lesson_code,
             }
         return {"success": False, "error": f"No EPUB found in {input_path}"}
 
@@ -194,6 +181,34 @@ def _resolve_input(input_str: str) -> dict:
                     }
 
     return {"success": False, "error": f"Could not resolve: {input_str}"}
+
+
+def _extract_lesson_code(directory: Path) -> str:
+    """Extract lab package SKU from pyproject.toml or metadata.yml, falling back to dir name."""
+    # Try pyproject.toml first (most authoritative for lab package SKU)
+    pyproject = directory / "classroom" / "grading" / "pyproject.toml"
+    if pyproject.exists():
+        try:
+            content = pyproject.read_text()
+            match = re.search(r'name\s*=\s*"rht-labs-([^"]+)"', content)
+            if match:
+                return match.group(1).lower()
+        except Exception:
+            pass
+
+    # Try metadata.yml
+    metadata = directory / "metadata.yml"
+    if metadata.exists():
+        try:
+            with open(metadata) as f:
+                meta = yaml.safe_load(f)
+                if meta and 'code' in meta:
+                    return meta['code'].lower()
+        except Exception:
+            pass
+
+    # Fall back to directory name
+    return directory.name.lower()
 
 
 def _find_course_dir(input_str: str) -> Path:
@@ -375,9 +390,9 @@ def cmd_detect(args):
         try:
             with open(outline_path) as f:
                 outline = yaml.safe_load(f)
-            root = outline.get('course', outline.get('lesson', {}))
+            root = outline.get('course', outline.get('lesson', outline.get('dco', {})))
 
-            courseinfo = root.get('courseinfo', root.get('lessoninfo', {}))
+            courseinfo = root.get('courseinfo', root.get('lessoninfo', root.get('bookinfo', {})))
             info["course_title"] = courseinfo.get('title') or courseinfo.get('goal')
             info["product_name"] = courseinfo.get('product_name')
             info["status"] = courseinfo.get('status')
