@@ -187,23 +187,60 @@ This step is **optional** — only needed for TC-WEB testing with Playwright or 
 
 ## Testing Methodology
 
-### Two-Pass Approach
+### Phased Approach
 
-**Pass 1: Student Simulation** — Execute the exercise as a student would:
-- TC-PREREQ → TC-EXEC → TC-STUDENTSIM → TC-VERIFY (GEs) → TC-CLEAN
+All applicable test categories run automatically for every exercise. The skill determines which TCs apply based on exercise type (GE vs Lab), available artifacts (solution files, solve scripts), and mode (`--e2e`).
 
-**Pass 2: QA Validation** — Validate grading, solutions, and reliability:
-- TC-SOL → TC-GRADE (Labs) → TC-IDEM → TC-E2E → TC-CONTRACT → TC-INSTRUCT → TC-SECURITY → TC-WEB
+**Phase 0: Static Analysis** (no live execution)
+- TC-EXEC — command pre-flight validation (always)
+- TC-INSTRUCT — instruction quality (always)
+- TC-SECURITY — security review (always)
+- TC-CONTRACT — contract validation (Labs with solution files)
 
-Run Pass 1 first. If it passes, run Pass 2 for thorough validation. If Pass 1 fails, document the bugs and skip Pass 2.
+**Phase 1: Student Simulation**
+- TC-PREREQ — lab start (always)
+- TC-GRADE pre-check — grade without solution, expect FAIL (Labs only)
+- TC-STUDENTSIM — execute exercise (always)
+- TC-VERIFY — verification steps (GEs only)
+- TC-GRADE post-check — grade after simulation, expect PASS (Labs only)
+- TC-WEB — web verification (if exercise deploys web apps or uses web consoles)
+- TC-CLEAN — lab finish + re-start verification (always)
+
+**Phase 2: Solution Validation** (separate cycle)
+- TC-SOL — fresh start → apply solutions → grade/verify → finish (if solution files exist)
+- TC-SOLVE — fresh start → lab solve → grade/verify → finish (if lab solve available)
+- Run whichever applies; if both exist, run both as separate cycles
+
+**Phase 3: Idempotency** (if Phase 1 passed)
+- TC-IDEM — repeat Phase 1, compare results
+
+**E2E** — only in `--e2e` mode (cross-exercise, fundamentally different from per-exercise testing)
 
 Use the **Recipes** section below to execute each step efficiently — the recipes eliminate the common trial-and-error that slows testing down.
+
+### Quick-Reference Phase Checklists
+
+**GE (Guided Exercise):**
+```
+Phase 0: TC-EXEC → TC-INSTRUCT → TC-SECURITY
+Phase 1: lab start → student sim → verify → lab finish → re-start check → lab finish
+Phase 2: lab start → apply solutions → run playbooks → verify → lab finish (if solution files exist)
+Phase 3: compare Phase 1 vs Phase 2 results (or repeat Phase 1 if no solutions)
+```
+
+**Lab:**
+```
+Phase 0: TC-EXEC → TC-INSTRUCT → TC-SECURITY → TC-CONTRACT
+Phase 1: lab start → grade (pre-check, expect mostly FAIL) → student sim → grade (post-check, expect PASS) → lab finish → re-start check → lab finish
+Phase 2: lab start → apply solutions → run playbooks → grade (expect PASS) → lab finish (if solution files exist)
+Phase 3: compare Phase 1 vs Phase 2 results (or repeat Phase 1 if no solutions)
+```
 
 ### Batch Chapter Testing
 
 When testing all exercises in a chapter:
 1. Get the exercise list from `epub_tool.py parse` filtered by chapter
-2. Test each exercise sequentially (start → sim → clean)
+2. Test each exercise sequentially through all applicable phases (Phase 0 → 1 → 2 → 3)
 3. Track results as JSON for each exercise
 4. Use `report_tool.py chapter` to generate the summary report
 5. Use `report_tool.py score` to calculate the quality score
@@ -276,6 +313,7 @@ Notes:
 - The `.devcontainer/podman/devcontainer.json` variant uses the local registry and works without auth. The tool checks for it automatically.
 - Files written to the project directory on the workstation appear inside the container automatically (bind mount).
 - If the EE pull fails with "no space left on device", run `ssh_tool.py run "podman system prune -af"` on workstation first.
+- **Container user matters for grading.** The `devcontainer-start` command reads `containerUser` from `devcontainer.json` and passes it as `--user` to `podman run`. This sets the container's default user, which grading scripts inherit when running `podman exec`. If the container user is wrong (e.g., image default instead of `root`), grading may fail with permission errors even though student simulation succeeded.
 
 ### Recipe: Writing Files
 
@@ -299,7 +337,7 @@ ssh_tool.py write-file /home/student/<exercise>/file2.yml --content "$(base64 -w
 
 ### Recipe: Applying Solution Files
 
-For TC-SOL testing (Pass 2). Start from a clean state.
+For TC-SOL testing (Phase 2). Start from a clean state.
 
 ```bash
 # 1. List available solution files
@@ -386,9 +424,11 @@ A single `lab start` covers both the without-solution and with-solution grade ch
 # 1. Start fresh
 ssh_tool.py lab start <exercise>
 
-# 2. Grade WITHOUT solution (expect all FAIL — validates grading isn't trivially passing)
+# 2. Grade WITHOUT solution (expect most checks to FAIL)
 ssh_tool.py lab grade <exercise>
-# If all checks PASS here → P1 FALSE POSITIVE bug
+# Analyze per-check: checks for student-created artifacts should FAIL
+# Checks for lab-start-provisioned resources may legitimately PASS
+# If ALL checks PASS → P1 FALSE POSITIVE bug
 
 # 3. Apply solution files (see Recipe: Applying Solution Files)
 
@@ -440,20 +480,11 @@ ssh_tool.py run "ansible-vault encrypt --vault-password-file /tmp/vault-pass /ho
 
 ## Test Categories
 
-Execute these for each exercise. Collect ALL bugs before reporting (error summary pattern — don't fail-fast). Categories are organized into two tiers.
-
-### Tier 1 — Always Run
-
-These categories form the core testing flow and must be run for every exercise.
-
-#### TC-PREREQ: Prerequisites
-
-1. Run `ssh_tool.py lab start <exercise>`
-2. If start fails due to blocking lab, ssh_tool handles it automatically (finishes blocking lab, retries)
-3. If start has FAIL in output, report as P0 bug
-4. Verify SSH connectivity to all managed hosts the exercise uses (check the course profile's `real_hosts`)
+Execute these for each exercise. Collect ALL bugs before reporting (error summary pattern — don't fail-fast). All applicable TCs run automatically — the skill determines applicability based on exercise type, available artifacts, and mode.
 
 #### TC-EXEC: Command Pre-flight Validation
+
+**Applies to:** All exercises. **Phase:** 0 (static analysis).
 
 Before running commands on live systems, validate them:
 
@@ -465,7 +496,82 @@ Before running commands on live systems, validate them:
    - **Consistency** — filenames in commands match filenames in prose/file_actions
 3. Report issues as P2 (syntax) or P3 (style) bugs WITHOUT executing them
 
+#### TC-INSTRUCT: Instruction Quality
+
+**Applies to:** All exercises. **Phase:** 0 (static analysis).
+
+Analyze the quality of EPUB instructions:
+
+1. **Completeness**: Every file the student needs to create should have clear content specified. Vague instructions like "add the appropriate content" without showing what: **P2 bug**
+2. **Accuracy**: Commands in instructions should match the expected tool versions. e.g., `ansible-playbook` in a course that uses `ansible-navigator`: **P2 bug**
+3. **Clarity**: Steps should be unambiguous. If a step could be interpreted multiple ways: **P3 bug**
+4. **Ordering**: Steps should be in a logical order. If step N references something created in step N+2: **P2 bug**
+5. **Consistency**: File names, variable names, and host names should be consistent throughout the exercise: **P3 bug**
+
+#### TC-SECURITY: Security Review
+
+**Applies to:** All exercises. **Phase:** 0 (static analysis).
+
+Check for security anti-patterns in exercise content:
+
+1. **Hardcoded credentials**: Passwords in plain text in playbooks (other than vault-encrypted): **P2 bug**
+2. **Overly permissive files**: `chmod 777`, world-readable credential files: **P2 bug**
+3. **Insecure protocols**: HTTP where HTTPS should be used, telnet instead of SSH: **P3 bug**
+4. **Root access**: Unnecessary use of `become: true` or running as root when not needed: **P3 bug**
+5. **Missing validation**: Playbooks that don't validate input or use `unsafe`: **P3 bug**
+
+Note: Many exercises intentionally use simple credentials for teaching purposes. Only flag security issues that teach bad habits students might carry to production.
+
+#### TC-CONTRACT: Contract Validation
+
+**Applies to:** Labs with solution files. **Phase:** 0 (static analysis).
+
+Verify alignment between EPUB instructions, solution files, and grading scripts:
+
+1. **EPUB → Solutions**: Every file the EPUB tells students to create should have a corresponding solution file. Missing solutions: **P2 bug**
+2. **Solutions → Grading**: Every check in the grading script should be satisfiable by the solution files. If grading checks something the solutions don't provide: **P1 bug**
+3. **EPUB → Grading**: Every outcome the EPUB claims should be validated by grading (for Labs). If the EPUB describes an outcome that grading doesn't check: **P2 bug**
+4. **Naming consistency**: Exercise IDs, file paths, and variable names should be consistent across EPUB, solutions, and grading. Mismatches: **P3 bug**
+
+#### TC-PREREQ: Prerequisites
+
+**Applies to:** All exercises. **Phase:** 1.
+
+1. Run `ssh_tool.py lab start <exercise>`
+2. If start fails due to blocking lab, ssh_tool handles it automatically (finishes blocking lab, retries)
+3. If start has FAIL in output, report as P0 bug
+4. Verify SSH connectivity to all managed hosts the exercise uses (check the course profile's `real_hosts`)
+
+#### TC-GRADE: Grading (Labs Only)
+
+**Applies to:** Labs only. **Phase:** 1 (integrated into student simulation cycle).
+
+**Critical: DynoLabs grading exit codes do NOT indicate pass/fail of checks.** See `.skilldata/docs/dynolabs-grading.md`.
+
+**Pre-check** (after lab start, before any work):
+```bash
+ssh_tool.py lab grade <exercise>
+```
+- Exit code 0 is normal (script completed)
+- Parse output for PASS/FAIL indicators
+- Analyze each check individually: most should fail, but some may legitimately pass if `lab start` pre-configures resources that grading also checks (e.g., installing packages, enabling services). This is a grading weakness, not a false positive.
+- If ALL checks pass: **P1 FALSE POSITIVE bug** (grading doesn't validate anything)
+- If checks pass that correspond to student-created artifacts (inventory files, playbook-applied config): **P1 FALSE POSITIVE bug** for those specific checks
+- Document which checks pass pre-simulation and why — this informs whether grading adequately distinguishes student work from lab setup
+
+**Post-check** (after student simulation completes):
+```bash
+ssh_tool.py lab grade <exercise>
+```
+- Exit code must be 0 (non-zero = P0 script crash)
+- All checks SHOULD pass
+- If any check fails: **P1 FALSE NEGATIVE bug** (grading rejects correct solution)
+
+**Grade message quality**: Check that error messages are clear and actionable, not raw Python tracebacks or cryptic codes. Unclear messages are P2 bugs.
+
 #### TC-STUDENTSIM: Student Simulation
+
+**Applies to:** All exercises. **Phase:** 1.
 
 **This is the core test.** Execute the exercise as a student would, step by step.
 
@@ -524,7 +630,18 @@ Then execute step by step:
 - EE image pull with "no space left on device" is an environment issue
 - `ansible-navigator` returning non-zero with `PLAY RECAP` means the playbook ran but had Ansible errors — read the output to determine if it's an exercise bug or expected behavior
 
+**Troubleshooting exercises:** These exercises have deliberately broken configurations. The student's task is to identify and fix problems. Strategy:
+1. Read all instructions first to understand what's broken and what the fix should be
+2. Run the initial commands — they WILL fail (this is intentional, not a bug)
+3. Apply the fixes described in the EPUB instructions
+4. Re-run the commands — they should now succeed
+5. Only report a bug if the exercise fails AFTER applying the documented fixes
+
+**ansible-navigator output noise:** `ansible-navigator` may emit base64-encoded UUID strings (e.g., `ZZZZZ...==`) interleaved with playbook output. These are metadata artifacts from the execution environment, not errors. Ignore them when parsing output — look for `PLAY RECAP` and task results to determine success/failure.
+
 #### TC-VERIFY: Verification (GEs)
+
+**Applies to:** GEs only. **Phase:** 1.
 
 For Guided Exercises, after completing the student simulation (see **Recipe: Verification (GEs)**):
 
@@ -533,125 +650,9 @@ For Guided Exercises, after completing the student simulation (see **Recipe: Ver
 3. If a verification step fails after successfully completing all prior steps, it's a **P1 bug** — the instructions don't produce the outcome they claim
 4. Common verification patterns: `curl`, `ssh host 'command'`, `ansible-navigator inventory --list`, `systemctl status`
 
-#### TC-CLEAN: Cleanup
-
-1. Run `ssh_tool.py lab finish <exercise>`
-2. If finish has FAIL in output: **P1 cleanup bug**
-3. Verify cleanup completeness: run `ssh_tool.py lab start <exercise>` again
-4. If start fails after finish: **P1 incomplete cleanup**
-5. Check that cleanup removes ALL artifacts:
-   - Users, groups, files, directories created during the exercise
-   - Services started/enabled
-   - Configuration changes
-   - Firewall rules
-   - Containers, images
-6. Run `ssh_tool.py lab finish <exercise>` to clean up after verification
-
-### Tier 2 — On Request
-
-Run these when explicitly requested, when investigating specific issues, or during thorough QA passes.
-
-#### TC-SOL: Solution Files
-
-Tested SEPARATELY from student simulation — fresh start, apply solutions, verify. See **Recipe: Applying Solution Files** and **Recipe: Grade Validation (Labs)**.
-
-1. Run `ssh_tool.py lab start <exercise>` (fresh start, clean state)
-2. Copy each solution file to its correct location on workstation
-3. For `.sol` extension files: copy without the `.sol` suffix
-4. Run any playbooks the solutions provide (check EPUB instructions for the `ansible-navigator run` commands)
-5. Verify the exercise works: for Labs, run `lab grade`; for GEs, run verification commands
-6. If solution files don't produce the expected state: **P1 bug**
-7. Run `ssh_tool.py lab finish <exercise>` to clean up
-
-#### TC-SOLVE: Solve Scripts (if available)
-
-Some exercises have a `lab solve <exercise>` command that applies solutions automatically.
-
-1. Run `ssh_tool.py lab start <exercise>` (fresh start)
-2. Run `ssh_tool.py lab solve <exercise>` (if the framework supports it)
-3. For Labs: run `lab grade` — should pass
-4. For GEs: run verification commands — should pass
-5. If solve doesn't produce a gradeable/verifiable state: **P1 bug**
-6. Run `ssh_tool.py lab finish <exercise>` to clean up
-
-#### TC-GRADE: Grading (Labs Only)
-
-**Critical: DynoLabs grading exit codes do NOT indicate pass/fail of checks.** See `.skilldata/docs/dynolabs-grading.md`.
-
-1. **Grade WITHOUT solution** (after lab start, before any work):
-   ```bash
-   ssh_tool.py lab grade <exercise>
-   ```
-   - Exit code 0 is normal (script completed)
-   - Parse output for PASS/FAIL indicators
-   - All checks SHOULD fail (student hasn't done anything)
-   - If all checks pass: **P1 FALSE POSITIVE bug** (grading doesn't validate anything)
-
-2. **Apply solution files** (or complete student simulation)
-
-3. **Grade WITH solution**:
-   ```bash
-   ssh_tool.py lab grade <exercise>
-   ```
-   - Exit code must be 0 (non-zero = P0 script crash)
-   - All checks SHOULD pass
-   - If any check fails: **P1 FALSE NEGATIVE bug** (grading rejects correct solution)
-
-4. **Grade message quality**: Check that error messages are clear and actionable, not raw Python tracebacks or cryptic codes. Unclear messages are P2 bugs.
-
-#### TC-CONTRACT: Contract Validation
-
-Verify alignment between EPUB instructions, solution files, and grading scripts:
-
-1. **EPUB → Solutions**: Every file the EPUB tells students to create should have a corresponding solution file. Missing solutions: **P2 bug**
-2. **Solutions → Grading**: Every check in the grading script should be satisfiable by the solution files. If grading checks something the solutions don't provide: **P1 bug**
-3. **EPUB → Grading**: Every outcome the EPUB claims should be validated by grading (for Labs). If the EPUB describes an outcome that grading doesn't check: **P2 bug**
-4. **Naming consistency**: Exercise IDs, file paths, and variable names should be consistent across EPUB, solutions, and grading. Mismatches: **P3 bug**
-
-#### TC-IDEM: Idempotency
-
-Run the full cycle (start → simulate → grade → finish) at least twice. Compare results.
-
-1. **Cycle 1**: Normal execution
-2. **Cycle 2**: Should produce identical results
-3. If cycle 2 fails where cycle 1 passed: **P1 state pollution bug**
-4. Common idempotency issues:
-   - Incomplete cleanup (not removing all artifacts)
-   - Asymmetric operations (setup on host A, cleanup on host B)
-   - Conditional artifacts (created based on conditions, cleanup unconditional)
-   - Forgotten dependencies (groups, files, services not cleaned)
-
-#### TC-E2E: Exercise Independence
-
-Validate that exercises don't depend on state from previous exercises.
-
-1. Run exercise B WITHOUT running exercise A first
-2. If exercise B fails because it assumes state from exercise A: **P1 independence bug**
-3. Exception: progressive exercises (check course profile for `progressive_exercises: true`) are allowed to depend on prior exercises, but must declare their dependencies
-
-#### TC-INSTRUCT: Instruction Quality
-
-Analyze the quality of EPUB instructions:
-
-1. **Completeness**: Every file the student needs to create should have clear content specified. Vague instructions like "add the appropriate content" without showing what: **P2 bug**
-2. **Accuracy**: Commands in instructions should match the expected tool versions. e.g., `ansible-playbook` in a course that uses `ansible-navigator`: **P2 bug**
-3. **Clarity**: Steps should be unambiguous. If a step could be interpreted multiple ways: **P3 bug**
-4. **Ordering**: Steps should be in a logical order. If step N references something created in step N+2: **P2 bug**
-5. **Consistency**: File names, variable names, and host names should be consistent throughout the exercise: **P3 bug**
-
-#### TC-SECURITY: Security Review
-
-Check for security anti-patterns in exercise content:
-
-1. **Hardcoded credentials**: Passwords in plain text in playbooks (other than vault-encrypted): **P2 bug**
-2. **Overly permissive files**: `chmod 777`, world-readable credential files: **P2 bug**
-3. **Insecure protocols**: HTTP where HTTPS should be used, telnet instead of SSH: **P3 bug**
-4. **Root access**: Unnecessary use of `become: true` or running as root when not needed: **P3 bug**
-5. **Missing validation**: Playbooks that don't validate input or use `unsafe`: **P3 bug**
-
-Note: Many exercises intentionally use simple credentials for teaching purposes. Only flag security issues that teach bad habits students might carry to production.
-
 #### TC-WEB: Web Application and Web Console Testing
+
+**Applies to:** Exercises that deploy web apps or use web consoles. **Phase:** 1.
 
 For exercises that deploy web applications or use web consoles (OpenShift, AAP Controller, Satellite):
 
@@ -700,6 +701,76 @@ For exercises that deploy web applications or use web consoles (OpenShift, AAP C
 - Use `rht-labs-aapcli` at `~/git-repos/active/rht-labs-aapcli` for API operations
 - Or use `web_tool.py api-get/api-post` for direct REST API calls
 - Controller URL is typically `https://controller.example.com` or as specified in the exercise
+
+#### TC-CLEAN: Cleanup
+
+**Applies to:** All exercises. **Phase:** 1.
+
+1. Run `ssh_tool.py lab finish <exercise>`
+2. If finish has FAIL in output: **P1 cleanup bug**
+3. Verify cleanup completeness: run `ssh_tool.py lab start <exercise>` again
+4. If start fails after finish: **P1 incomplete cleanup**
+5. Check that cleanup removes ALL artifacts:
+   - Users, groups, files, directories created during the exercise
+   - Services started/enabled
+   - Configuration changes
+   - Firewall rules
+   - Containers, images
+6. Run `ssh_tool.py lab finish <exercise>` to clean up after verification
+
+#### TC-SOL: Solution Files
+
+**Applies to:** Exercises with solution files. **Phase:** 2.
+
+Tested SEPARATELY from student simulation — fresh start, apply solutions, verify. See **Recipe: Applying Solution Files** and **Recipe: Grade Validation (Labs)**.
+
+1. Run `ssh_tool.py lab start <exercise>` (fresh start, clean state)
+2. Copy each solution file to its correct location on workstation
+3. For `.sol` extension files: copy without the `.sol` suffix
+4. Run any playbooks the solutions provide (check EPUB instructions for the `ansible-navigator run` commands)
+5. Verify the exercise works: for Labs, run `lab grade`; for GEs, run verification commands
+6. If solution files don't produce the expected state: **P1 bug**
+7. Run `ssh_tool.py lab finish <exercise>` to clean up
+
+#### TC-SOLVE: Solve Scripts
+
+**Applies to:** Exercises where `lab solve` is available. **Phase:** 2.
+
+Some exercises have a `lab solve <exercise>` command that applies solutions automatically.
+
+1. Run `ssh_tool.py lab start <exercise>` (fresh start)
+2. Run `ssh_tool.py lab solve <exercise>` (if the framework supports it)
+3. For Labs: run `lab grade` — should pass
+4. For GEs: run verification commands — should pass
+5. If solve doesn't produce a gradeable/verifiable state: **P1 bug**
+6. Run `ssh_tool.py lab finish <exercise>` to clean up
+
+#### TC-IDEM: Idempotency
+
+**Applies to:** All exercises (skip if Phase 1 failed). **Phase:** 3.
+
+Run the full cycle (start → simulate → grade → finish) at least twice. Compare results.
+
+**Shortcut:** If TC-SOL ran successfully in Phase 2, it already constitutes a second full cycle (fresh start → apply solutions → grade → finish). Compare TC-SOL results against Phase 1 results — if both passed, idempotency is validated without a third cycle. Only run a dedicated TC-IDEM cycle when TC-SOL was not executed or when investigating a suspected cleanup issue.
+
+1. **Cycle 1**: Normal execution (Phase 1)
+2. **Cycle 2**: TC-SOL (if run) or repeat Phase 1
+3. If cycle 2 fails where cycle 1 passed: **P1 state pollution bug**
+4. Common idempotency issues:
+   - Incomplete cleanup (not removing all artifacts)
+   - Asymmetric operations (setup on host A, cleanup on host B)
+   - Conditional artifacts (created based on conditions, cleanup unconditional)
+   - Forgotten dependencies (groups, files, services not cleaned)
+
+#### TC-E2E: Exercise Independence
+
+**Applies to:** `--e2e` mode only.
+
+Validate that exercises don't depend on state from previous exercises.
+
+1. Run exercise B WITHOUT running exercise A first
+2. If exercise B fails because it assumes state from exercise A: **P1 independence bug**
+3. Exception: progressive exercises (check course profile for `progressive_exercises: true`) are allowed to depend on prior exercises, but must declare their dependencies
 
 ## Bug Severity
 
@@ -771,7 +842,7 @@ When testing multiple exercises (chapter or course), also generate a **summary r
 
 ### Report Structure
 
-Only include TC sections that were actually run. Omit sections that weren't executed.
+Only include TC sections that apply to this exercise type. Omit sections for TCs that don't apply (e.g., TC-VERIFY for Labs, TC-GRADE for GEs).
 
 ```markdown
 # Exercise QA Report: <exercise-id>
@@ -792,12 +863,29 @@ Only include TC sections that were actually run. Omit sections that weren't exec
 
 ## Test Results
 
-### TC-PREREQ
-- lab start: PASS/FAIL (Xs)
+### Phase 0: Static Analysis
 
 ### TC-EXEC
 - Commands validated: N
 - Issues found: [list]
+
+### TC-INSTRUCT
+- Instruction quality issues: [list]
+
+### TC-SECURITY
+- Security findings: [list]
+
+### TC-CONTRACT (Lab only)
+- EPUB ↔ Solutions alignment: PASS/FAIL
+- Solutions ↔ Grading alignment: PASS/FAIL
+
+### Phase 1: Student Simulation
+
+### TC-PREREQ
+- lab start: PASS/FAIL (Xs)
+
+### TC-GRADE pre-check (Lab only)
+- Without solution: <expected FAIL, got ...>
 
 ### TC-STUDENTSIM
 - Steps executed: N/M
@@ -809,33 +897,33 @@ Only include TC sections that were actually run. Omit sections that weren't exec
 ### TC-VERIFY (GE only)
 - Verification steps: passed/failed
 
-### TC-SOL (if run)
-- Solution files applied: N/M
-- Playbooks executed: [list]
-- Result: PASS/FAIL
-
-### TC-GRADE (Lab only, if run)
-- Without solution: <expected FAIL, got ...>
+### TC-GRADE post-check (Lab only)
 - With solution: <expected PASS, got ...>
 - Message quality: Good | Needs improvement
 
-### TC-CONTRACT (if run)
-- EPUB ↔ Solutions alignment: PASS/FAIL
-- Solutions ↔ Grading alignment: PASS/FAIL
+### TC-WEB
+- Web verification: PASS/FAIL
 
 ### TC-CLEAN
 - lab finish: PASS/FAIL (Xs)
 - Re-start verification: PASS/FAIL
 
-### TC-IDEM (if run)
+### Phase 2: Solution Validation
+
+### TC-SOL
+- Solution files applied: N/M
+- Playbooks executed: [list]
+- Result: PASS/FAIL
+
+### TC-SOLVE
+- lab solve: PASS/FAIL
+- Grade/verify after solve: PASS/FAIL
+
+### Phase 3: Idempotency
+
+### TC-IDEM
 - Cycle 1: PASS/FAIL
 - Cycle 2: PASS/FAIL
-
-### TC-INSTRUCT (if run)
-- Instruction quality issues: [list]
-
-### TC-SECURITY (if run)
-- Security findings: [list]
 
 ## Bugs Found
 | ID | Severity | Category | Description | Fix Recommendation | Component |

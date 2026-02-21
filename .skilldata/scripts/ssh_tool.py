@@ -868,7 +868,9 @@ def cmd_devcontainer_start(args, state):
     # run_args are parsed from devcontainer.json (podman flags like --cap-add SYS_PTRACE),
     # treated as trusted project config, not raw user input
     args_str = " ".join(run_args)
+    user_flag = f"--user {shlex.quote(container_user)}" if container_user else ""
     cmd = (f"podman run -d --name {shlex.quote(container_name)} "
+           f"{user_flag} "
            f"{args_str} "
            f"-v {shlex.quote(project_dir)}:/workspaces/{shlex.quote(exercise_name)}:Z "
            f"-v {home_dir}/.ssh:{container_ssh_dir}:z "
