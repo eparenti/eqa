@@ -260,13 +260,24 @@ def _get_subnets(state):
     return []
 
 
-def _detect_framework(state: dict) -> tuple:
-    """Detect which lab framework is available.
+def _detect_framework(state: dict) -> dict:
+    """Detect which lab framework is available and validate it works.
 
     Uses a series of probes to identify the framework.  Each probe is
     independent — if one detection method stops working, others still
     function.  The command prefix is always 'lab' unless the only
     grading mechanism found is a uv-based Python package.
+
+    After detection, validates the CLI actually works by running a simple
+    command.  Known issues (e.g., missing setuptools) are auto-fixed.
+
+    Returns a dict with keys:
+        framework: str — framework name (dynolabs5-rust, wrapper, etc.)
+        prefix: str — command prefix to use
+        validated: bool — whether the CLI was validated to work
+        issues: list[str] — issues found during validation
+        fixes_applied: list[str] — auto-fixes that were applied
+        lab_cli_version: str|None — version string from `lab --version`
     """
     host = state["host"]
     opts = _ssh_opts(state)
@@ -277,46 +288,254 @@ def _detect_framework(state: dict) -> tuple:
                 ['ssh'] + opts + [host, command],
                 capture_output=True, text=True, timeout=timeout,
             )
-            return result.returncode == 0, _strip_ansi(result.stdout)
+            return result.returncode, _strip_ansi(result.stdout), _strip_ansi(result.stderr)
         except Exception:
-            return False, ""
+            return -1, "", ""
+
+    result = {
+        "framework": "unknown",
+        "prefix": "lab",
+        "validated": False,
+        "issues": [],
+        "fixes_applied": [],
+        "lab_cli_version": None,
+    }
 
     # Probe 1: Is there a `lab` command in PATH?
-    ok, stdout = ssh_run("which lab 2>/dev/null")
-    if ok and stdout.strip():
+    rc, stdout, _ = ssh_run("which lab 2>/dev/null")
+    if rc == 0 and stdout.strip():
         lab_path = stdout.strip()
 
-        # Sub-probe: binary type (informational — doesn't gate functionality)
-        ok, file_type = ssh_run(f"file {lab_path} 2>/dev/null")
-        file_type_lower = file_type.lower() if ok else ""
-        is_binary = 'elf' in file_type_lower or 'executable' in file_type_lower
-        is_script = 'script' in file_type_lower or 'text' in file_type_lower
+        # Get version info — this tells us the framework generation
+        rc_ver, ver_out, ver_err = ssh_run("lab -v 2>&1")
+        ver_combined = ver_out + ver_err
+        ver_match = re.search(r'Lab framework version:\s*(\S+)', ver_combined)
+        lib_match = re.search(r'Course library version:\s*(\S+)', ver_combined)
 
-        # Sub-probe: ask `lab` for its version/capabilities
-        # Try multiple detection methods — any one succeeding is enough
-        framework_name = 'dynolabs'
-        ok_ver, ver_out = ssh_run("lab --version 2>&1")
-        if ok_ver and ver_out.strip():
-            _err(f"Lab CLI version: {ver_out.strip()}")
+        if ver_match:
+            fw_version = ver_match.group(1)
+            result["lab_cli_version"] = fw_version
+            _err(f"Lab framework version: {fw_version}")
+            major = int(fw_version.split('.')[0])
+        else:
+            # Fallback: try `lab --version` (DynoLabs 5 style)
+            rc_ver2, ver_out2, _ = ssh_run("lab --version 2>&1")
+            if rc_ver2 == 0 and ver_out2.strip():
+                fw_version = ver_out2.strip()
+                result["lab_cli_version"] = fw_version
+                _err(f"Lab CLI version: {fw_version}")
+                try:
+                    major = int(fw_version.split('.')[0])
+                except ValueError:
+                    major = None
+            else:
+                fw_version = None
+                major = None
 
-        if is_binary:
-            # Compiled binary — likely Rust CLI (DynoLabs 5+)
-            framework_name = 'dynolabs5-rust'
-        elif is_script:
-            framework_name = 'wrapper'
+        if lib_match:
+            result["course_lib_version"] = lib_match.group(1)
+            _err(f"Course library version: {lib_match.group(1)}")
 
-        # Regardless of detection confidence, the prefix is always 'lab'
-        return (framework_name, 'lab')
+        # Detect framework generation by checking available commands.
+        # DynoLabs 5 (Rust CLI) has: list, force, activate, status, solve
+        # DynoLabs 4 (Python CLI) has: select, fix, upgrade, system-info
+        rc_help, help_out, _ = ssh_run("lab --help 2>&1")
+        has_list = 'list' in help_out
+        has_force = 'force' in help_out
+        has_select = 'select' in help_out
+        has_status = 'status' in help_out
+        has_fix = bool(re.search(r'\bfix\b', help_out))
+
+        if has_list and has_force:
+            framework_name = 'dynolabs5'
+        elif has_select and not has_list:
+            framework_name = 'dynolabs4'
+        elif major and major >= 5:
+            framework_name = 'dynolabs5'
+        elif major and major < 5:
+            framework_name = 'dynolabs4'
+        else:
+            framework_name = 'dynolabs'
+
+        # Store capability flags so cmd_lab() can map commands correctly
+        result["framework"] = framework_name
+        result["prefix"] = "lab"
+        result["capabilities"] = {
+            "has_list": has_list,
+            "has_force": has_force,
+            "has_select": has_select,
+            "has_status": has_status,
+            "has_fix": has_fix,
+            "solve_cmd": "solve" if not has_fix else "fix",
+        }
+
+        # Validate: actually try running the CLI
+        result = _validate_and_fix_framework(result, ssh_run)
+        return result
 
     # Probe 2: uv-based Python grading (no `lab` binary in PATH)
-    ok_uv, _ = ssh_run("which uv 2>/dev/null")
+    rc_uv, _, _ = ssh_run("which uv 2>/dev/null")
     for grading_dir in ['~/grading', '~/.grading']:
-        ok_g, g_out = ssh_run(f"test -f {grading_dir}/pyproject.toml && echo 'exists'")
-        if ok_uv and ok_g and 'exists' in g_out:
-            return ('dynolabs5-python', f'cd {grading_dir} && uv run lab')
+        rc_g, g_out, _ = ssh_run(f"test -f {grading_dir}/pyproject.toml && echo 'exists'")
+        if rc_uv == 0 and rc_g == 0 and 'exists' in g_out:
+            result["framework"] = "dynolabs5-python"
+            result["prefix"] = f"cd {grading_dir} && uv run lab"
+            result = _validate_and_fix_framework(result, ssh_run)
+            return result
 
-    # Probe 3: nothing found — return unknown, still try 'lab' as prefix
-    return ('unknown', 'lab')
+    # Probe 3: nothing found
+    result["issues"].append("No lab CLI found on workstation")
+    return result
+
+
+# Known error patterns and their auto-fix generators.
+# Each entry: (error_pattern, fix_command_fn, fix_description)
+# fix_command_fn receives the combined error output and returns (command, timeout).
+
+
+def _fix_missing_pkg_resources(error_output: str):
+    """Generate fix command for missing pkg_resources.
+
+    pkg_resources was removed from setuptools >= 78.  We find the uv-managed
+    venv from the traceback path and install setuptools<78 there.
+    """
+    # Extract the site-packages path from the traceback
+    m = re.search(r'(/home/\S+/site-packages)/labs/', error_output)
+    if m:
+        sp = m.group(1)
+        return (f"pip3 install --quiet 'setuptools<78' --target '{sp}' 2>&1", 60)
+    # Fallback: install into all uv venvs that have the grading package
+    return (
+        "for SP in $(find /home/student/.cache/uv/archive-v0/ "
+        "-path '*/site-packages/labs/grading.py' -printf '%h\\n' 2>/dev/null "
+        "| sed 's|/labs$||'); do "
+        "  pip3 install --quiet 'setuptools<78' --target \"$SP\" 2>&1; "
+        "done",
+        120,
+    )
+
+
+_KNOWN_FRAMEWORK_FIXES = [
+    (r"No module named 'pkg_resources'", _fix_missing_pkg_resources,
+     "Installed setuptools<78 (provides pkg_resources)"),
+    (r"No module named 'setuptools'", _fix_missing_pkg_resources,
+     "Installed setuptools<78"),
+]
+
+
+def _validate_and_fix_framework(result: dict, ssh_run) -> dict:
+    """Validate that the lab CLI works by running `lab list`.
+
+    If it fails with a known error, attempt auto-fix and retry.
+    Updates the result dict in-place with validation status.
+    """
+    prefix = result["prefix"]
+
+    # Try `lab --version` first (fast, informational) — only if not already set
+    if not result.get("lab_cli_version"):
+        rc, stdout, stderr = ssh_run(f"{prefix} --version 2>&1")
+        combined = stdout + stderr
+        if rc == 0 and stdout.strip():
+            result["lab_cli_version"] = stdout.strip()
+            _err(f"Lab CLI version: {stdout.strip()}")
+
+    # Validate by running a non-destructive command that exercises the full
+    # CLI stack including the Python grading package.
+    #
+    # Strategy varies by framework:
+    # - DynoLabs 5: `lab list` (Rust-only) + Python grading import test
+    # - DynoLabs 4: `lab -v` (already got version) + `lab select --help`
+    #   (exercises the Python CLI without side effects)
+    #
+    # In both cases, a successful `lab -v` with parseable output means
+    # the CLI binary works.  For DynoLabs 4, the binary IS the Python
+    # package (PyInstaller-compiled), so if -v works, the whole stack works.
+
+    framework_name = result["framework"]
+
+    if framework_name == 'dynolabs4':
+        # DynoLabs 4: the CLI is a compiled Python binary.
+        # If `lab -v` produced a version, the binary is functional.
+        if result.get("lab_cli_version"):
+            result["validated"] = True
+            _err(f"DynoLabs 4 CLI validated (v{result['lab_cli_version']})")
+            return result
+        # Try one more command
+        rc_sel, stdout_sel, _ = ssh_run(f"{prefix} select --help 2>&1", timeout=10)
+        if rc_sel == 0 and 'Usage' in stdout_sel:
+            result["validated"] = True
+            _err("DynoLabs 4 CLI validated via 'select --help'")
+            return result
+        combined = stdout_sel
+    else:
+        # DynoLabs 5: test both the Rust binary and Python grading
+        rc_list, stdout_list, stderr_list = ssh_run(f"{prefix} list 2>&1", timeout=15)
+        combined_list = stdout_list + stderr_list
+
+        # Test the Python grading import chain (uv-managed venv)
+        grading_test_cmd = (
+            "GRADING_PY=$(find /home/student/.cache/uv/archive-v0/ "
+            "-path '*/site-packages/labs/grading.py' -print -quit 2>/dev/null); "
+            "if [ -z \"$GRADING_PY\" ]; then echo 'no_grading_venv'; exit 0; fi; "
+            "VENV_DIR=$(echo \"$GRADING_PY\" | sed 's|/lib/.*||'); "
+            "\"$VENV_DIR/bin/python3\" -c "
+            "'from labs.grading import Default; print(\"grading_ok\")' 2>&1"
+        )
+        rc_grading, stdout_grading, _ = ssh_run(grading_test_cmd, timeout=15)
+        combined_grading = stdout_grading
+
+        if rc_list == 0 and 'Traceback' not in combined_list:
+            if 'grading_ok' in combined_grading:
+                result["validated"] = True
+                return result
+            elif 'no_grading_venv' in combined_grading:
+                # No uv venvs — might be a fresh install or DL4 misdetected
+                result["validated"] = True
+                return result
+            elif 'Traceback' in combined_grading:
+                _err("Lab CLI (Rust) works but Python grading package is broken")
+                combined = combined_grading
+            else:
+                result["validated"] = True
+                return result
+        else:
+            combined = combined_list + combined_grading
+
+    # CLI failed — check for known fixable errors
+    _err(f"Lab CLI validation failed. Checking for known issues...")
+    debug_log(f"framework validation failed: {combined[:500]}", caller="ssh", level=30)
+
+    for pattern, fix_fn, fix_desc in _KNOWN_FRAMEWORK_FIXES:
+        if re.search(pattern, combined):
+            _err(f"Detected: {fix_desc}. Attempting auto-fix...")
+            fix_cmd, fix_timeout = fix_fn(combined)
+            fix_rc, fix_out, fix_err = ssh_run(fix_cmd, timeout=fix_timeout)
+            if fix_rc == 0:
+                result["fixes_applied"].append(fix_desc)
+                _err(f"Fix applied: {fix_desc}")
+            else:
+                result["issues"].append(f"Auto-fix failed for: {fix_desc}")
+                _err(f"Auto-fix failed: {fix_desc} (rc={fix_rc})")
+                debug_log(f"fix failed: {fix_out} {fix_err}", caller="ssh", level=30)
+
+    # Retry validation after fixes
+    if result["fixes_applied"]:
+        rc, stdout, stderr = ssh_run(f"{prefix} list 2>&1", timeout=15)
+        combined = stdout + stderr
+        if rc == 0 and 'Traceback' not in combined:
+            result["validated"] = True
+            _err("Lab CLI now working after auto-fix")
+            return result
+
+    # Still broken — record the issue
+    if not result["validated"]:
+        # Extract the specific error for diagnostics
+        tb_match = re.search(r'(\w+Error: .+)$', combined, re.MULTILINE)
+        error_msg = tb_match.group(1) if tb_match else f"lab list failed (rc={rc})"
+        result["issues"].append(error_msg)
+        _err(f"Lab CLI broken: {error_msg}")
+
+    return result
 
 
 @json_safe
@@ -382,21 +601,29 @@ def cmd_connect(args):
         "framework_prefix": None,
     }
 
-    # Detect lab framework
-    framework, prefix = _detect_framework(state)
-    state["framework"] = framework
-    state["framework_prefix"] = prefix
+    # Detect and validate lab framework
+    fw = _detect_framework(state)
+    state["framework"] = fw["framework"]
+    state["framework_prefix"] = fw["prefix"]
+    state["framework_validated"] = fw["validated"]
+    state["framework_capabilities"] = fw.get("capabilities", {})
 
     save_state(STATE_FILE, state)
-    debug_log(f"connected host={host} framework={framework} prefix={prefix!r}",
+    debug_log(f"connected host={host} framework={fw['framework']} "
+              f"prefix={fw['prefix']!r} validated={fw['validated']}",
               caller="ssh")
 
     _output({
         "success": True,
         "host": host,
         "control_path": control_path,
-        "framework": framework,
-        "framework_prefix": prefix,
+        "framework": fw["framework"],
+        "framework_prefix": fw["prefix"],
+        "framework_validated": fw["validated"],
+        "framework_issues": fw["issues"],
+        "framework_fixes_applied": fw["fixes_applied"],
+        "lab_cli_version": fw["lab_cli_version"],
+        "capabilities": fw.get("capabilities", {}),
     })
 
 
@@ -610,12 +837,30 @@ def cmd_lab(args, state):
     prefix = state.get("framework_prefix", "lab")
     framework = state.get("framework", "unknown")
 
-    # 'force' bypasses framework prefix, uses raw exercise as SKU
-    if action == 'force':
+    caps = state.get("framework_capabilities", {})
+
+    if not state.get("framework_validated", True) and framework != "unknown":
+        _err(f"Warning: Lab CLI ({framework}) was not validated during connect. "
+             "Commands may fail. Re-run 'connect' to re-validate.")
+
+    # Map actions to actual CLI commands based on framework capabilities.
+    # DynoLabs 4 uses 'fix' instead of 'solve', 'select' instead of
+    # 'activate', and doesn't have 'force', 'list', or 'status'.
+    actual_action = action
+    if action == 'solve' and caps.get('has_fix') and not caps.get('has_list'):
+        actual_action = 'fix'
+        _err(f"Mapped 'solve' → 'fix' (DynoLabs 4 CLI)")
+    elif action == 'force' and not caps.get('has_force'):
+        # DynoLabs 4 doesn't have 'force' — use 'install' instead
+        _err(f"'force' not available on {framework}, using 'install' instead")
+        actual_action = 'install'
+
+    # 'force' bypasses framework prefix, uses raw exercise as SKU (DynoLabs 5)
+    if action == 'force' and caps.get('has_force'):
         cmd = f"lab force {shlex.quote(exercise)}"
     else:
         lab_name = exercise
-        cmd = f"{prefix} {action} {shlex.quote(lab_name)}"
+        cmd = f"{prefix} {actual_action} {shlex.quote(lab_name)}"
     _err(f"Running: {cmd} (framework: {framework})")
     debug_log(f"lab {action} {exercise} framework={framework} cmd={cmd!r}",
               caller="ssh")
@@ -632,9 +877,14 @@ def cmd_lab(args, state):
                 _err(f"Finishing blocking lab: {blocking}")
                 _ssh_exec(state, f"{prefix} finish {shlex.quote(blocking)}", timeout=120)
             else:
-                # Blocked but can't extract name — try status reset
-                _err("Blocked by another lab (name unknown), attempting status reset")
-                _ssh_exec(state, f"{prefix} status --reset", timeout=30)
+                # Blocked but can't extract name
+                if caps.get('has_status'):
+                    _err("Blocked by another lab (name unknown), attempting status reset")
+                    _ssh_exec(state, f"{prefix} status --reset", timeout=30)
+                else:
+                    _err("Blocked by another lab (name unknown). "
+                         "DynoLabs 4 has no status reset — trying lab finish for this exercise.")
+                    _ssh_exec(state, f"{prefix} finish {shlex.quote(exercise)}", timeout=120)
             _err(f"Retrying: {cmd}")
             ok, stdout, stderr, rc, duration = _ssh_exec(state, cmd, timeout=timeout)
             success = ok

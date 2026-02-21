@@ -1,6 +1,6 @@
 ---
 name: eqa
-version: 7.1.0
+version: 7.2.0
 description: Automated exercise QA for Red Hat Training courses
 authors:
   - Ed Parenti <eparenti@redhat.com>
@@ -71,7 +71,7 @@ When invoked, follow these steps in order:
 python3 ~/git-repos/eqa/.skilldata/scripts/course_tool.py resolve <input> [--chapter N]
 ```
 
-Returns `{epub_path, lesson_path, lesson_code}`. If chapter is specified, resolves course outline to the correct lesson.
+Returns `{epub_path, lesson_path, lesson_code, lab_framework, lab_framework_version}`. If chapter is specified, resolves course outline to the correct lesson. The `lab_framework` field indicates the grading framework version: `dynolabs5` (rht-labs-core >= 4.0), `dynolabs4` (older), `python`, `shell`, or `none`.
 
 ### 2. Parse EPUB
 
@@ -87,7 +87,40 @@ Returns `{course_code, course_title, exercises: [{id, type, title, solution_file
 python3 ~/git-repos/eqa/.skilldata/scripts/ssh_tool.py connect --host workstation
 ```
 
-Establishes ControlMaster connection, detects lab framework. State persists in `~/.cache/eqa/ssh-state.json`.
+Establishes ControlMaster connection, detects and **validates** the lab framework. State persists in `~/.cache/eqa/ssh-state.json`.
+
+The connect output includes:
+- `framework`: detected framework (`dynolabs4`, `dynolabs5`, `dynolabs5-rust`, `wrapper`, `unknown`)
+- `framework_validated`: whether the CLI was tested and works
+- `framework_issues`: any issues found during validation
+- `framework_fixes_applied`: auto-fixes applied (e.g., missing `setuptools`)
+- `lab_cli_version`: version string from the CLI
+- `capabilities`: command availability flags (see below)
+
+#### DynoLabs Version Differences
+
+The skill auto-detects the lab CLI version and adapts commands accordingly:
+
+| Feature | DynoLabs 5 (Rust CLI) | DynoLabs 4 (Python CLI) |
+|---------|----------------------|------------------------|
+| Install package | `lab install <sku>` | `lab install <sku>` |
+| Force install | `lab force <sku>` | N/A (use `lab install`) |
+| List courses | `lab list` | N/A |
+| Switch course | `lab activate <sku>` | `lab select <sku>` |
+| Auto-solve | `lab solve <exercise>` | `lab fix <exercise>` |
+| Reset status | `lab status --reset` | N/A |
+| Show version | `lab version` | `lab -v` |
+| Show status | `lab status` | N/A |
+
+The `ssh_tool.py lab` command handles this mapping automatically — you can always use `ssh_tool.py lab solve <exercise>` and it will translate to `lab fix` on DynoLabs 4. Similarly, `ssh_tool.py lab force <sku>` will fall back to `lab install` on DynoLabs 4.
+
+#### Framework Validation and Auto-Fix
+
+During `connect`, the tool validates the CLI works by running test commands. Known issues are auto-fixed:
+- **Missing `pkg_resources`**: Older grading packages import `pkg_resources` (removed from `setuptools >= 78`). The tool auto-installs `setuptools<78` into the correct venv.
+- **Missing `setuptools`**: Same fix applied.
+
+If `framework_validated` is `false` after connect, lab commands may fail. Check `framework_issues` for diagnostics.
 
 ### 4. Build Course Profile
 
@@ -141,54 +174,77 @@ The grading package on the workstation **must match** the EPUB being tested. A v
 
 #### How lab packages work
 
-The DynoLabs 5 Rust CLI (`/usr/local/bin/lab`) manages Python grading packages via `uv`. Key concepts:
+The lab CLI manages Python grading packages. The architecture differs by DynoLabs version:
 
-- **Lab manifest** (`~/.grading/lab_manifest.json`): Maps exercise names to course SKUs and versions
-- **Course packages** (e.g., `rht-labs-do316`, `rht-labs-au0022l`): Python packages containing grading scripts, Ansible playbooks, and lab materials
-- **Active course**: Only one course is "active" at a time (`lab version` shows it)
+- **DynoLabs 5** (Rust CLI): Uses `uv` to manage Python venvs. Binary at `/usr/local/bin/lab`. Each course gets its own isolated venv under `~/.cache/uv/archive-v0/`.
+- **DynoLabs 4** (Python CLI): Compiled Python binary (PyInstaller). Manages packages via `pip`. Active course selected via `lab select`.
+
+Common concepts:
+- **Course packages** (e.g., `rht-labs-do316`, `rht-labs-do457`): Python packages containing grading scripts, Ansible playbooks, and lab materials
+- **Active course**: Only one course is "active" at a time
 - **PyPI mirror**: Packages are fetched from the Red Hat internal PyPI mirror (typically `pypi.apps.tools-na.prod.nextcle.com`, but may vary by environment)
 
 #### Package installation commands
 
+**DynoLabs 5 (Rust CLI):**
+
 | Command | Behavior | Use When |
 |---------|----------|----------|
-| `lab install <sku>` | Respects manifest constraints, blocks non-manifest packages | Normal student/instructor use |
-| `lab force <sku>` | **Bypasses all constraints**, always updates manifest | Dev/testing, installing packages not in manifest |
+| `lab install <sku>` | Respects manifest constraints | Normal use |
+| `lab force <sku>` | **Bypasses all constraints** | Dev/testing |
 | `lab force <sku>=<version>` | Force-installs exact version | Testing specific version |
-| `lab activate <sku>` | Switches active course (no install) | Switching between already-installed courses |
-| `lab list` | Shows installed courses and active status | Checking what's available |
-| `lab version` | Shows active course library and version | Verifying active package |
+| `lab activate <sku>` | Switches active course (no install) | Switching courses |
+| `lab list` | Shows installed courses | Checking what's available |
+| `lab version` | Shows active course and version | Verifying active package |
+
+**DynoLabs 4 (Python CLI):**
+
+| Command | Behavior | Use When |
+|---------|----------|----------|
+| `lab install <sku>` | Installs/updates course package | Normal use |
+| `lab select <sku>` | Switches active course | Switching courses |
+| `lab -v` | Shows framework and course version | Verifying active package |
+| `lab upgrade` | Upgrades the course library | Getting latest version |
 
 #### Step 5 workflow
 
 **a) Check what's installed:**
 ```bash
+# DynoLabs 5:
 ssh_tool.py run "lab version"
 ssh_tool.py run "lab list"
+
+# DynoLabs 4:
+ssh_tool.py run "lab -v"
 ```
+
+The `connect` output tells you which framework is active — check `framework` and `capabilities`.
 
 **b) Determine the correct package SKU.** The `course_tool.py resolve` output includes the `lesson_code`. For multi-repo courses, each chapter has its own SKU (e.g., `au0022l`). For single-repo courses, the SKU is the course code (e.g., `do316`).
 
 **c) Install or force-install the package:**
 
 ```bash
-# If the package is in the manifest:
+# Both DynoLabs versions:
 ssh_tool.py lab install <lesson_code>
 
-# If blocked ("not part of this course curriculum"), use force:
+# DynoLabs 5 only — if blocked ("not part of this course curriculum"):
 ssh_tool.py run "lab force <lesson_code>"
+# (ssh_tool.py lab force automatically falls back to install on DynoLabs 4)
 ```
-
-`lab force` bypasses the manifest version lock and course validation. It is designed for developers and testers. It always updates the manifest to reflect the forced installation.
 
 **d) Verify the active package matches:**
 ```bash
+# DynoLabs 5:
 ssh_tool.py run "lab version"
+
+# DynoLabs 4:
+ssh_tool.py run "lab -v"
 ```
 
-**e) For multi-repo courses**, `lab install` or `lab force` must be run each time you switch to a different lesson — installing a new lesson replaces the previous one.
+**e) For multi-repo courses**, `lab install` must be run each time you switch to a different lesson — installing a new lesson replaces the previous one.
 
-#### Namespace syntax for cross-course exercises
+#### Namespace syntax for cross-course exercises (DynoLabs 5 only)
 
 When multiple installed courses have exercises with the same name, use namespace syntax:
 ```bash
@@ -1234,7 +1290,8 @@ When blocked by an environment issue, report it as ENV in the summary and note t
 - **All steps pass but grade fails**: Check if solution files need to be applied differently, or if grading checks something the instructions don't cover
 - **AAP Controller web UI steps**: Use `rht-labs-aapcli` or Controller REST API via `web_tool.py api-get/api-post`
 - **Switching lessons in multi-repo course**: Must run `lab install <new-lesson>` (or `lab force <new-lesson>`) before testing exercises in a different lesson
-- **`lab install` fails "not part of this course curriculum"**: Use `lab force <sku>` to bypass manifest constraints. This is normal when the workstation is provisioned for a different course (e.g., workstation has DO981 but you're testing DO316 exercises). `lab force` always works and updates the manifest.
+- **`lab install` fails "not part of this course curriculum"**: Use `lab force <sku>` to bypass manifest constraints (DynoLabs 5 only). On DynoLabs 4, `lab install` is the only option — if it fails, check `lab select` to switch courses.
+- **DynoLabs 4 vs 5**: Check the `framework` field from `ssh_tool.py connect` output. DynoLabs 4 uses `fix` instead of `solve`, `select` instead of `activate`, and lacks `force`, `list`, `status`. The `ssh_tool.py lab` command handles this mapping automatically.
 - **Version mismatch between EPUB and installed package**: The installed grading package may have different VM names, exercise logic, or grading checks than the EPUB. Use `lab force <sku>` to install the correct version matching the EPUB. Check `lab version` vs the git repo's `pyproject.toml`
 - **OCP exercise needs storage**: Always run `oc get sc` first to find the right storage class. Don't hardcode storage class names
 - **Running commands inside VMs**: Use `ssh_tool.py vm-exec <vm> -n <ns> -c <cmd>`. It tries `virtctl ssh` first (key auth), then falls back to serial console with login automation. Check `vm_auth` and `vm_default_password` in the course profile for auth method.
@@ -1252,7 +1309,11 @@ When blocked by an environment issue, report it as ENV in the summary and note t
 
 See `.skilldata/docs/lab-cli.md` for full DynoLabs 5 reference including package management, lab operations, testing features, key files, and environment variables.
 
-Key commands: `lab start/finish/grade/solve <exercise>`, `lab force <sku>` (bypass manifest), `lab version`, `lab list`, `lab status --reset`.
+**DynoLabs 5** key commands: `lab start/finish/grade/solve <exercise>`, `lab force <sku>` (bypass manifest), `lab version`, `lab list`, `lab status --reset`.
+
+**DynoLabs 4** key commands: `lab start/finish/grade/fix <exercise>`, `lab install <sku>`, `lab select <sku>`, `lab -v`, `lab upgrade`.
+
+The `ssh_tool.py lab` command abstracts the differences — use `solve` and the tool maps to `fix` on DynoLabs 4 automatically. Check `capabilities` from the connect output to know what's available.
 
 References: [Lab CLI (Rust)](https://github.com/RedHatTraining/classroom-api), [rht-labs-core](https://github.com/RedHatTraining/rht-labs-core)
 

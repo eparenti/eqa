@@ -21,6 +21,36 @@ import yaml
 from eqa_common import _output, _err, find_epub, json_safe, load_config
 
 
+def _detect_lab_framework(repo_path: Path) -> dict:
+    """Detect lab framework type and version from the course repo.
+
+    Returns dict with keys: lab_framework, lab_framework_version (optional).
+    """
+    pyproject_path = repo_path / "classroom" / "grading" / "pyproject.toml"
+    if pyproject_path.exists():
+        try:
+            content = pyproject_path.read_text()
+            match = re.search(r'rht-labs-core[=<>~]+([0-9.]+)', content)
+            if match:
+                ver = match.group(1)
+                major = int(ver.split('.')[0])
+                return {
+                    "lab_framework": "dynolabs5" if major >= 4 else "dynolabs4",
+                    "lab_framework_version": ver,
+                }
+            elif 'aap_api' in content or 'aap-api' in content:
+                return {"lab_framework": "aap_api"}
+            else:
+                return {"lab_framework": "python"}
+        except Exception:
+            return {"lab_framework": "unknown"}
+    else:
+        grading_dir = repo_path / "classroom" / "grading"
+        if grading_dir.exists() and list(grading_dir.glob("**/*.sh")):
+            return {"lab_framework": "shell"}
+        return {"lab_framework": "none"}
+
+
 @json_safe
 def cmd_resolve(args):
     """Resolve input (lesson code, path, course code) to epub_path + lesson_path."""
@@ -90,7 +120,7 @@ def _resolve_chapter(input_str: str, chapter_num: int) -> dict:
         if not epub:
             return {"success": False, "error": f"No EPUB found for {lesson_code}"}
 
-        return {
+        result = {
             "success": True,
             "epub_path": str(epub),
             "lesson_path": str(lesson_dir),
@@ -99,6 +129,8 @@ def _resolve_chapter(input_str: str, chapter_num: int) -> dict:
             "keyword": keyword,
             "multi_repo": True,
         }
+        result.update(_detect_lab_framework(lesson_dir))
+        return result
     else:
         # Local chapter — use the course EPUB
         epub = find_epub(course_dir)
@@ -109,7 +141,7 @@ def _resolve_chapter(input_str: str, chapter_num: int) -> dict:
 
         course_code = _extract_lesson_code(course_dir)
 
-        return {
+        result = {
             "success": True,
             "epub_path": str(epub),
             "lesson_path": str(course_dir),
@@ -118,6 +150,8 @@ def _resolve_chapter(input_str: str, chapter_num: int) -> dict:
             "keyword": keyword,
             "multi_repo": False,
         }
+        result.update(_detect_lab_framework(course_dir))
+        return result
 
 
 def _resolve_input(input_str: str) -> dict:
@@ -126,11 +160,13 @@ def _resolve_input(input_str: str) -> dict:
 
     # Direct EPUB path
     if input_path.suffix == '.epub' and input_path.exists():
-        return {
+        result = {
             "success": True,
             "epub_path": str(input_path),
             "lesson_path": str(input_path.parent),
         }
+        result.update(_detect_lab_framework(input_path.parent))
+        return result
 
     # Directory
     if input_path.is_dir():
@@ -139,12 +175,14 @@ def _resolve_input(input_str: str) -> dict:
             epub = _try_build_epub(input_path)
         if epub:
             lesson_code = _extract_lesson_code(input_path)
-            return {
+            result = {
                 "success": True,
                 "epub_path": str(epub),
                 "lesson_path": str(input_path),
                 "lesson_code": lesson_code,
             }
+            result.update(_detect_lab_framework(input_path))
+            return result
         return {"success": False, "error": f"No EPUB found in {input_path}"}
 
     # Lesson code search
@@ -162,23 +200,27 @@ def _resolve_input(input_str: str) -> dict:
         if candidate.is_dir():
             epub = find_epub(candidate)
             if epub:
-                return {
+                result = {
                     "success": True,
                     "epub_path": str(epub),
                     "lesson_path": str(candidate),
                     "lesson_code": input_str.lower(),
                 }
+                result.update(_detect_lab_framework(candidate))
+                return result
 
         for lesson_dir in base.glob(f"*-lessons/{input_str}"):
             if lesson_dir.is_dir():
                 epub = find_epub(lesson_dir)
                 if epub:
-                    return {
+                    result = {
                         "success": True,
                         "epub_path": str(epub),
                         "lesson_path": str(lesson_dir),
                         "lesson_code": input_str.lower(),
                     }
+                    result.update(_detect_lab_framework(lesson_dir))
+                    return result
 
     return {"success": False, "error": f"Could not resolve: {input_str}"}
 
@@ -361,29 +403,8 @@ def cmd_detect(args):
     else:
         info["course_type"] = "traditional" if (repo_path / "guides").exists() else "unknown"
 
-    # Lab framework
-    pyproject_path = repo_path / "classroom" / "grading" / "pyproject.toml"
-    if pyproject_path.exists():
-        try:
-            content = pyproject_path.read_text()
-            match = re.search(r'rht-labs-core[=<>~]+([0-9.]+)', content)
-            if match:
-                ver = match.group(1)
-                major = int(ver.split('.')[0])
-                info["lab_framework"] = "dynolabs5" if major >= 4 else "dynolabs4"
-                info["lab_framework_version"] = ver
-            elif 'aap_api' in content or 'aap-api' in content:
-                info["lab_framework"] = "aap_api"
-            else:
-                info["lab_framework"] = "python"
-        except Exception:
-            info["lab_framework"] = "unknown"
-    else:
-        grading_dir = repo_path / "classroom" / "grading"
-        if grading_dir.exists() and list(grading_dir.glob("**/*.sh")):
-            info["lab_framework"] = "shell"
-        else:
-            info["lab_framework"] = "none"
+    # Lab framework (uses shared helper)
+    info.update(_detect_lab_framework(repo_path))
 
     # Parse outline for exercises and chapters
     if outline_path.exists():
