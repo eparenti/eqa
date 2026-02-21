@@ -903,6 +903,8 @@ Key commands:
 - `ssh_tool.py lab <action> <exercise>` — lab start/finish/grade/force/solve
 - `ssh_tool.py vm-exec <vm> -n <ns> -c <cmd>` — run command inside a VM
 - `ssh_tool.py vm-disks <vm> -n <ns>` — list VM disk attachments as JSON
+- `ssh_tool.py wait-for --mode {tcp,http,command,file} --target <target>` — poll until condition met
+- `ssh_tool.py diff <remote_path> --expected <base64>` — compare remote file against expected content
 - `ssh_tool.py tunnel` — generate sshuttle command for network tunnel
 - `web_tool.py login <url> --username <u> --password <p> --then <url>` — web console login
 - `diagnose_tool.py analyze <text>` — diagnose error output, suggest fixes
@@ -933,14 +935,6 @@ The skill auto-detects 3 course patterns from `outline.yml`:
 ### OpenShift / Kubernetes Courses (DO*)
 
 See `.skilldata/docs/ocp-recipes.md` for full OCP reference including VM disk operations, storage classes, web console testing with Playwright, dev container exercises, and ansible-navigator usage.
-
-Key points:
-- Use `ssh_tool.py vm-exec <vm> -n <ns> -c <cmd>` to run commands inside VMs (auto-detects SSH vs console auth)
-- Use `ssh_tool.py vm-disks <vm> -n <ns>` to verify disk attachments
-- Use `virtctl addvolume --persist` for SCSI hot-plug, DataVolume + `oc patch` for virtio
-- Use `web_tool.py login <console-url> --username admin --password redhatocp --then <target-url>` for web console
-- Always append `-m stdout` to `ansible-navigator` commands
-- For dev containers: `devcontainer-start` → `devcontainer-run` → let `lab finish` handle cleanup
 
 ## Environment Issues vs Exercise Bugs
 
@@ -976,9 +970,6 @@ When blocked by an environment issue, report it as ENV in the summary and note t
 - **Exercise not found in EPUB**: Check for fuzzy matches (the exercise ID in instructions may differ from what was requested)
 - **Grade passes without solution**: This is a P1 bug, not a false alarm. DynoLabs grading SHOULD fail when student hasn't done the work
 - **All steps pass but grade fails**: Check if solution files need to be applied differently, or if grading checks something the instructions don't cover
-- **EE image pull fails "no space left on device"**: Environment issue. Run `podman system prune -af` and `rm -rf ~/.cache/uv` on workstation
-- **Exercise has GUI steps**: Translate to programmatic equivalents (see GUI translation table in TC-STUDENTSIM)
-- **ansible-navigator hangs**: Missing `-m stdout` flag. Always append it for non-interactive execution
 - **AAP Controller web UI steps**: Use `rht-labs-aapcli` or Controller REST API via `web_tool.py api-get/api-post`
 - **Switching lessons in multi-repo course**: Must run `lab install <new-lesson>` (or `lab force <new-lesson>`) before testing exercises in a different lesson
 - **`lab install` fails "not part of this course curriculum"**: Use `lab force <sku>` to bypass manifest constraints. This is normal when the workstation is provisioned for a different course (e.g., workstation has DO981 but you're testing DO316 exercises). `lab force` always works and updates the manifest.
