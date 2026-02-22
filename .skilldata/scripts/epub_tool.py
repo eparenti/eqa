@@ -124,6 +124,25 @@ def _build_exercise_map(content_path):
         except Exception as e:
             _err(f"Warning: Error parsing {html_file.name}: {e}")
 
+    # Validation: warn if HTML files have sections but none matched the
+    # expected CSS classes.  This catches silent failures when the EPUB
+    # template changes its class names (e.g. sect2, ge, lab).
+    if not exercise_map:
+        total_sections = 0
+        for html_file in sorted(list(content_path.glob("*.xhtml")) + list(content_path.glob("*.html"))):
+            try:
+                with open(html_file, 'r', encoding='utf-8') as f:
+                    soup = BeautifulSoup(f, 'html.parser')
+                total_sections += len(soup.find_all('section'))
+            except Exception:
+                pass
+        if total_sections > 0:
+            _err(
+                f"WARNING: Found {total_sections} <section> elements but "
+                f"none matched expected exercise classes (sect2 + ge/lab). "
+                f"The EPUB template may have changed its CSS class names."
+            )
+
     _exercise_map_cache[content_key] = exercise_map
     return exercise_map
 
