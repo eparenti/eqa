@@ -11,14 +11,12 @@ Usage:
 import argparse
 import os
 import re
-import shutil
-import subprocess
 import sys
 from pathlib import Path
 
 import yaml
 
-from eqa_common import _output, _err, find_epub, json_safe, load_config
+from eqa_common import _output, _err, find_epub, json_safe, load_config, build_epub
 
 
 def _detect_lab_framework(repo_path: Path) -> dict:
@@ -315,23 +313,10 @@ def _find_lesson_dir(course_dir: Path, lesson_code: str) -> Path:
     return None
 
 
-def _try_build_epub(directory: Path) -> Path:
+def _try_build_epub(directory: Path) -> Path | None:
     """Try to build EPUB using sk."""
-    sk_path = shutil.which("sk")
-    if not sk_path or not (directory / "outline.yml").exists():
-        return None
-
-    _err(f"Building EPUB for {directory.name}...")
-    try:
-        result = subprocess.run(
-            [sk_path, "build", "epub3"],
-            cwd=directory, capture_output=True, text=True, timeout=600,
-        )
-        if result.returncode == 0:
-            return find_epub(directory)
-    except Exception:
-        pass
-    return None
+    epub, _ = build_epub(directory)
+    return epub
 
 
 @json_safe

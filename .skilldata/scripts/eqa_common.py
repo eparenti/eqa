@@ -11,6 +11,8 @@ import logging
 import logging.handlers
 import os
 import re
+import shutil
+import subprocess
 import sys
 import traceback
 from pathlib import Path
@@ -191,11 +193,67 @@ def find_epub(directory):
     return None
 
 
+def build_epub(directory: Path) -> tuple[Path | None, str | None]:
+    """Build EPUB using sk. Returns (epub_path, error_message).
+
+    Locates the sk build tool, ensures ssh-agent is loaded, and runs
+    'sk build epub3'. On success returns (Path, None). On failure
+    returns (None, human-readable error string).
+    """
+    sk_path = shutil.which("sk")
+    if not sk_path:
+        for p in ["/usr/bin/sk", "/usr/local/bin/sk"]:
+            if os.path.exists(p):
+                sk_path = p
+                break
+
+    if not sk_path:
+        return None, "sk tool not found"
+
+    if not (directory / "outline.yml").exists():
+        return None, "Not a scaffolding course (no outline.yml)"
+
+    # Ensure ssh-agent has a key loaded (sk needs it for submodule access)
+    try:
+        result = subprocess.run(
+            ["ssh-add", "-l"], capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode != 0:
+            for key in [Path.home() / ".ssh" / "id_ed25519",
+                        Path.home() / ".ssh" / "id_rsa"]:
+                if key.exists():
+                    subprocess.run(
+                        ["ssh-add", str(key)],
+                        capture_output=True, text=True, timeout=10,
+                    )
+                    break
+    except Exception:
+        pass
+
+    _err(f"Building EPUB for {directory.name}...")
+    try:
+        result = subprocess.run(
+            [sk_path, "build", "epub3"],
+            cwd=directory, capture_output=True, text=True, timeout=600,
+        )
+        if result.returncode == 0:
+            epub = find_epub(directory)
+            return (epub, None) if epub else (None, "Build completed but EPUB not found")
+        output = result.stdout + result.stderr
+        if "Auth fail" in output or "JSchException" in output:
+            return None, "SSH auth failed. Run: eval $(ssh-agent) && ssh-add"
+        return None, f"Build failed (exit {result.returncode})"
+    except subprocess.TimeoutExpired:
+        return None, "Build timed out"
+    except Exception as e:
+        return None, str(e)
+
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
-_config: dict = None
+_config: dict | None = None
 
 _CONFIG_DEFAULTS = {
     "repos_dir": "~/git-repos/active",
@@ -224,8 +282,8 @@ def load_config() -> dict:
                 user = yaml.safe_load(f)
             if isinstance(user, dict):
                 _config.update(user)
-        except Exception:
-            pass
+        except Exception as e:
+            _err(f"Warning: failed to parse {config_path}: {e}")
 
     # Expand ~ in path values
     for key in ("repos_dir", "archive_dir"):

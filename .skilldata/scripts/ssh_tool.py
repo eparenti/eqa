@@ -272,7 +272,7 @@ def _detect_framework(state: dict) -> dict:
     command.  Known issues (e.g., missing setuptools) are auto-fixed.
 
     Returns a dict with keys:
-        framework: str — framework name (dynolabs5-rust, wrapper, etc.)
+        framework: str — framework name (dynolabs5, dynolabs4, dynolabs5-python, etc.)
         prefix: str — command prefix to use
         validated: bool — whether the CLI was validated to work
         issues: list[str] — issues found during validation
@@ -466,6 +466,7 @@ def _validate_and_fix_framework(result: dict, ssh_run) -> dict:
             result["validated"] = True
             _err("DynoLabs 4 CLI validated via 'select --help'")
             return result
+        rc = rc_sel
         combined = stdout_sel
     else:
         # DynoLabs 5: test both the Rust binary and Python grading
@@ -499,6 +500,7 @@ def _validate_and_fix_framework(result: dict, ssh_run) -> dict:
                 result["validated"] = True
                 return result
         else:
+            rc = rc_list
             combined = combined_list + combined_grading
 
     # CLI failed — check for known fixable errors
@@ -718,6 +720,8 @@ def cmd_run(args):
                 '-o', 'ControlMaster=yes',
                 '-o', 'ControlPersist=600',
                 '-o', 'ConnectTimeout=15',
+                '-o', 'ServerAliveInterval=30',
+                '-o', 'ServerAliveCountMax=3',
                 '-N', '-f',
                 host,
             ]
@@ -746,26 +750,31 @@ def cmd_run(args):
     })
 
 
-def _detect_blocking_lab(output: str) -> str | None:
+def _detect_blocking_lab(output: str) -> tuple[bool, str | None]:
     """Try to extract a blocking exercise name from lab output.
 
     Uses multiple heuristics so that a single format change doesn't
-    break auto-recovery.  Returns the exercise name or None.
+    break auto-recovery.
+
+    Returns (is_blocked, name):
+        (False, None)  — no blocking detected
+        (True, name)   — blocked by a specific exercise
+        (True, None)   — blocked but name could not be extracted
     """
     # Heuristic 1: message says "lab finish <name>"
     m = re.search(r'lab finish\s+(\S+)', output)
     if m:
-        return m.group(1)
+        return True, m.group(1)
     # Heuristic 2: message says "finish <name> first" or similar
     m = re.search(r'finish\s+["\']?(\S+?)["\']?\s+first', output, re.IGNORECASE)
     if m:
-        return m.group(1)
+        return True, m.group(1)
     # Heuristic 3: any mention of "already running/active" + an exercise name
     if re.search(r'already\s+(running|active|in progress)', output, re.IGNORECASE):
-        # Return None — we know it's blocked but can't extract the name.
+        # Blocked but can't extract the name.
         # Caller can try `lab status --reset` or ask the user.
-        return ""
-    return None
+        return True, None
+    return False, None
 
 
 def _detect_failure(stdout: str) -> bool:
@@ -871,11 +880,11 @@ def cmd_lab(args, state):
     # If lab start fails or warns about a blocking lab, finish it and retry.
     if action == 'start':
         output = stdout + stderr
-        blocking = _detect_blocking_lab(output)
-        if blocking is not None:
-            if blocking:
-                _err(f"Finishing blocking lab: {blocking}")
-                _ssh_exec(state, f"{prefix} finish {shlex.quote(blocking)}", timeout=120)
+        is_blocked, blocking_name = _detect_blocking_lab(output)
+        if is_blocked:
+            if blocking_name:
+                _err(f"Finishing blocking lab: {blocking_name}")
+                _ssh_exec(state, f"{prefix} finish {shlex.quote(blocking_name)}", timeout=120)
             else:
                 # Blocked but can't extract name
                 if caps.get('has_status'):
@@ -1423,7 +1432,7 @@ def cmd_devcontainer_stop(args, state):
 def cmd_autotest(args, state):
     """Run DynoLabs 5 autotest (Rust CLI only)."""
     framework = state.get("framework", "unknown")
-    if framework != 'dynolabs5-rust':
+    if framework != 'dynolabs5':
         _output({
             "success": False,
             "error": f"autotest requires DynoLabs 5 Rust CLI (detected: {framework})",
@@ -1450,7 +1459,7 @@ def cmd_autotest(args, state):
 def cmd_coursetest(args, state):
     """Run DynoLabs 5 coursetest (Rust CLI only)."""
     framework = state.get("framework", "unknown")
-    if framework != 'dynolabs5-rust':
+    if framework != 'dynolabs5':
         _output({
             "success": False,
             "error": f"coursetest requires DynoLabs 5 Rust CLI (detected: {framework})",

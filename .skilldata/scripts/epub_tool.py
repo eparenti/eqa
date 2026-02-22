@@ -16,12 +16,11 @@ import json
 import os
 import re
 import shutil
-import subprocess
 import sys
 import zipfile
 from pathlib import Path
 
-from eqa_common import _output, _err, get_cache_dir, find_epub, json_safe
+from eqa_common import _output, _err, get_cache_dir, find_epub, json_safe, build_epub
 
 # Lazy-loaded at first use
 _bs4_loaded = False
@@ -808,61 +807,17 @@ def cmd_build(args):
         _output({"success": False, "error": f"Course not found: {course_path}"})
         return
 
-    sk_path = shutil.which("sk")
-    if not sk_path:
-        for p in ["/usr/bin/sk", "/usr/local/bin/sk"]:
-            if os.path.exists(p):
-                sk_path = p
-                break
-
-    if not sk_path:
-        _output({"success": False, "error": "sk tool not found"})
-        return
-
-    if not (course_path / "outline.yml").exists():
-        _output({"success": False, "error": "Not a scaffolding course (no outline.yml)"})
-        return
-
     if not args.force:
         epub = find_epub(course_path)
         if epub:
             _output({"success": True, "epub_path": str(epub), "cached": True})
             return
 
-    # Ensure ssh-agent
-    try:
-        result = subprocess.run(["ssh-add", "-l"], capture_output=True, text=True, timeout=5)
-        if result.returncode != 0:
-            for key in [Path.home() / ".ssh" / "id_ed25519", Path.home() / ".ssh" / "id_rsa"]:
-                if key.exists():
-                    subprocess.run(["ssh-add", str(key)], capture_output=True, text=True, timeout=10)
-                    break
-    except Exception:
-        pass
-
-    _err(f"Building EPUB for {course_path.name}...")
-    try:
-        result = subprocess.run(
-            [sk_path, "build", "epub3"],
-            cwd=course_path, capture_output=True, text=True, timeout=600,
-        )
-        if result.returncode == 0:
-            epub = find_epub(course_path)
-            if epub:
-                _output({"success": True, "epub_path": str(epub)})
-                return
-            _output({"success": False, "error": "Build completed but EPUB not found"})
-        else:
-            output = result.stdout + result.stderr
-            if "Auth fail" in output or "JSchException" in output:
-                _output({"success": False, "error": "SSH auth failed. Run: eval $(ssh-agent) && ssh-add"})
-            else:
-                _output({"success": False, "error": f"Build failed (exit {result.returncode})",
-                         "stdout": result.stdout[-500:], "stderr": result.stderr[-500:]})
-    except subprocess.TimeoutExpired:
-        _output({"success": False, "error": "Build timed out"})
-    except Exception as e:
-        _output({"success": False, "error": str(e)})
+    epub, error = build_epub(course_path)
+    if epub:
+        _output({"success": True, "epub_path": str(epub)})
+    else:
+        _output({"success": False, "error": error})
 
 
 def main():

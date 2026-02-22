@@ -111,7 +111,12 @@ TOOL_PATTERNS = {
 
 def _read_all_content(epub_dir: Path) -> str:
     """Read all text from extracted EPUB HTML files."""
-    from bs4 import BeautifulSoup
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError:
+        raise ImportError(
+            "beautifulsoup4 is not installed. Run: pip install beautifulsoup4 lxml"
+        )
 
     all_text = []
     for html_file in sorted(list(epub_dir.rglob("*.xhtml")) + list(epub_dir.rglob("*.html"))):
