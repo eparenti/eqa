@@ -134,11 +134,18 @@ def cmd_build(args):
         _output({"success": False, "error": f"Directory not found: {epub_dir}"})
         return
 
+    # Validate this looks like an EPUB extract directory (should contain .xhtml files)
+    xhtml_files = list(epub_dir.rglob("*.xhtml")) + list(epub_dir.rglob("*.html"))
+    if not xhtml_files:
+        _err(f"WARNING: No .xhtml/.html files found in {epub_dir}. "
+             "This should be the EPUB extract directory (extract_dir from epub_tool.py parse), "
+             "not the course repo directory.")
+
     _err("Analyzing course content...")
     text = _read_all_content(epub_dir)
 
     if not text:
-        _output({"success": False, "error": "No content found in EPUB"})
+        _output({"success": False, "error": "No XHTML/HTML content found. Pass the EPUB extract directory (extract_dir from epub_tool.py parse), not the course repo."})
         return
 
     text_lower = text.lower()

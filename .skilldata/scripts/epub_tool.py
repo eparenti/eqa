@@ -359,15 +359,19 @@ def _parse_step(li, number: str) -> dict:
                 if fa:
                     file_actions.append(fa)
 
-    # Parse sub-steps
+    # Parse sub-steps from nested ordered lists
     sub_steps = []
-    nested_ols = li.find_all('ol', recursive=False)
+    nested_lists = li.find_all('ol', recursive=False)
     for div in li.find_all('div', class_='ordered-list', recursive=False):
-        nested_ols.extend(div.find_all('ol', recursive=False))
+        nested_lists.extend(div.find_all('ol', recursive=False))
+    # Also check itemized lists (ul inside div.itemized-list) — some EPUBs use
+    # unordered lists for sub-items that contain file content or commands
+    for div in li.find_all('div', class_=lambda c: c and 'itemized-list' in c, recursive=False):
+        nested_lists.extend(div.find_all('ul', recursive=False))
 
-    for nested_ol in nested_ols:
+    for nested_list in nested_lists:
         step_letter = 'a'
-        for nested_li in nested_ol.find_all('li', recursive=False):
+        for nested_li in nested_list.find_all('li', recursive=False):
             sub_step = _parse_step(nested_li, f"{number}.{step_letter}")
             if sub_step:
                 sub_steps.append(sub_step)
