@@ -1,13 +1,14 @@
 # eqa: Exercise QA for Red Hat Training
 
-A Claude Code skill (v7.4.0) that automates quality assurance testing for Red Hat Training course exercises.
+A Claude Code skill (v2.0.0) that automates quality assurance testing for Red Hat Training course exercises.
 
 ## What It Does
 
 - Tests exercises on live lab systems by simulating student workflows
 - Validates solution files, grading scripts, and cleanup
 - Diffs EPUB instructions against solution files (static and live)
-- Detects bugs and classifies by severity (P0-P3)
+- Detects bugs and classifies by severity (P0-P3) and type (TECH, PEDAGOGY, SEQUENCE, COMPLEXITY, GUIDANCE)
+- Distinguishes intentional errors (troubleshooting exercises) from real bugs
 - Handles dev containers, multi-repo courses, network devices, AAP Controller
 - Generates detailed QA reports with quality scores
 
@@ -42,7 +43,7 @@ Claude orchestrates the testing workflow, calling Python utilities for mechanica
 
 ```
 eqa/
-├── SKILL.md                         # Skill manifest (v7.4.0)
+├── SKILL.md                         # Skill manifest (v2.0.0)
 ├── .skilldata/
 │   ├── scripts/
 │   │   ├── ssh_tool.py              # SSH, lab commands, file transfer, VM access
@@ -51,7 +52,10 @@ eqa/
 │   │   ├── profile_tool.py          # Course profile from EPUB content
 │   │   ├── web_tool.py              # Playwright browser automation
 │   │   ├── diagnose_tool.py         # Error diagnosis
-│   │   └── report_tool.py           # Report generation + quality scoring
+│   │   ├── report_tool.py           # Report generation + quality scoring
+│   │   └── eqa_common.py            # Shared utilities
+│   ├── config/
+│   │   └── errors.yaml              # Error pattern database
 │   └── docs/
 │       ├── tools-reference.md       # Full tool documentation
 │       ├── lab-cli.md               # DynoLabs 4/5 reference
@@ -78,21 +82,23 @@ eqa/
 
 | Category | Phase | What It Tests |
 |----------|-------|---------------|
-| TC-EXEC | 0 | Command syntax, safety, dependencies |
+| TC-EXEC | 0 | Command syntax, safety, dependencies, anti-patterns |
 | TC-INSTRUCT | 0 | Instruction completeness, accuracy, clarity |
-| TC-SECURITY | 0 | Hardcoded credentials, insecure patterns |
-| TC-STATICDIFF | 0 | EPUB file content vs solution files (static comparison) |
+| TC-SECURITY | 0 | Hardcoded credentials, insecure patterns, permissions |
+| TC-STATICDIFF | 0 | EPUB file content vs solution files, complexity alignment, grading coverage |
 | TC-PREREQ | 1 | Lab start works, environment ready |
 | TC-GRADE | 1 | Grading validates correctly (Labs only) |
 | TC-STUDENTSIM | 1 | EPUB instructions execute correctly (incl. verification steps) |
 | TC-LIVEDIFF | 1 | Student-created files vs solution files (live comparison) |
 | TC-WEB | 1 | Web app/console accessibility |
-| TC-CLEAN | 1 | Cleanup complete, re-start works |
+| TC-CLEAN | 1 | Cleanup complete, re-start works, rollback resilience |
 | TC-SOL | 2 | Solution files produce correct state |
 | TC-SOLVE | 2 | `lab solve` produces correct state |
 | TC-IDEM | 3 | Consistent results across cycles |
 
-## Bug Severity
+## Bug Classification
+
+### Severity
 
 | Level | Description | Action |
 |-------|-------------|--------|
@@ -103,9 +109,19 @@ eqa/
 | LAB | Lab infrastructure (slow start, transient failures) | Report to lab team |
 | ENV | Environment (version mismatch, cluster not ready) | Report to operations |
 
+### Type
+
+| Type | Description |
+|------|-------------|
+| TECH | Technical failure (file not found, syntax error, service fails) |
+| PEDAGOGY | Solution contradicts what the course teaches |
+| SEQUENCE | Exercise uses concepts not yet taught |
+| COMPLEXITY | Exercise scope exceeds stated objective |
+| GUIDANCE | Intentional error lacks sufficient hints for students |
+
 ## Supported Course Types
 
-- **Network Automation** (DO457) — Cisco IOS, Juniper Junos via SSH/NETCONF
+- **Network Automation** (DO457) — Cisco IOS, Juniper JunOS, Arista EOS via SSH/NETCONF
 - **OpenShift** (DO316, DO280, etc.) — VMs, storage, web console
 - **Ansible Automation** (RH294, DO374, etc.) — Playbooks, roles, collections
 - **AAP Controller** (DO457, DO374) — Workflow templates, REST API

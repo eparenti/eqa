@@ -1,6 +1,6 @@
 ---
 name: eqa
-version: 7.4.0
+version: 2.0.0
 description: Automated exercise QA for Red Hat Training courses
 authors:
   - Ed Parenti <eparenti@redhat.com>
@@ -325,6 +325,7 @@ Format: `BUG-<TYPE>-NNN` (e.g., `BUG-PEDAGOGY-001`). Use `TECH` for standard tec
 - ALL exercises fail at same step → **ENV**
 - ONE exercise fails at unique step → exercise bug (P0-P3)
 - `lab start` fails but `oc`/`virtctl` work → grading script issue
+
 
 ## Quality Metrics & Reporting
 
