@@ -121,14 +121,35 @@ Collect ALL bugs before reporting (don't fail-fast). Exception: P0 blockers may 
 ### TC-EXEC (Phase 0, all)
 Validate commands for syntax errors, dangerous operations, missing dependencies, and naming consistency. Report as P2/P3.
 
+**Anti-patterns to flag** (P3):
+- `ignore_errors: yes` — should be avoided or used sparingly
+- `when: true` — redundant, remove the condition
+- `when: false` — dead code, task never runs
+- `command:.*sudo` — use `become: true` instead
+- `shell:.*cd` — use `chdir` parameter instead
+
+**Dependency skip-lists** (don't flag as missing):
+- Course-internal collections: `lab.*`, `training.*`, `classroom.*`, `rht.*` — bundled with lab packages
+- EE-included collections: `ansible.posix`, `ansible.netcommon`, `ansible.utils`, `ansible.controller`, `ansible.platform`, `awx.awx`, `community.general`, `community.mysql`, `community.postgresql`, `community.crypto`, `redhat.rhel_system_roles`, `containers.podman`, `kubernetes.core`
+
 ### TC-INSTRUCT (Phase 0, all)
 Check instruction completeness, accuracy, clarity, ordering, consistency. `...output omitted...` is normal — only a bug if the omitted section contains content the student needs.
 
 ### TC-SECURITY (Phase 0, all)
 Flag hardcoded credentials, `chmod 777`, insecure protocols, unnecessary root. Many exercises intentionally use simple credentials for teaching — only flag habits students might carry to production.
 
+**Scan patterns** (check solution files, skip files with `key`/`cert` in the name):
+- Credentials (P2): `password:\s*['"]`, `api[_-]?key:\s*['"]`, `token:\s*['"]`, `secret:\s*['"]`
+- Permissions (P3): `mode:\s*0?777`, `mode:\s*0?666`, `chmod\s+777`
+- Sudo (P3): `NOPASSWD:\s*ALL`
+- Secrets (P2): `-----BEGIN.*PRIVATE KEY-----`, `aws_secret_access_key`
+
 ### TC-STATICDIFF (Phase 0, if solutions exist)
 Static comparison of EPUB file content against solution files. Diff each file_action from the parsed instructions against its corresponding `.sol` file (strip `.sol` suffix to match). For Labs, also check grading alignment: grading checks something solutions don't provide = P1. Missing solution for an EPUB-created file = P2. Content mismatch = P3 (cosmetic) or P2 (behavioral).
+
+**Additional static checks:**
+- **Complexity alignment**: If EPUB has >10 steps but only 1 solution file, flag as P3 for review — may indicate missing solution files or overly detailed EPUB.
+- **Grading coverage gaps** (Labs): Extract `dest`/`path` from solution copy/template/file tasks and `name` from service/systemd tasks. If the grading script doesn't verify a solution-created resource, flag as P3.
 
 ### TC-PREREQ (Phase 1, all)
 Run `ssh_tool.py lab start <exercise>`. Auto-recovery handles blocking labs. If `success: false` → P0. Verify SSH to managed hosts.
@@ -140,6 +161,17 @@ Run `ssh_tool.py lab start <exercise>`. Auto-recovery handles blocking labs. If 
 
 ### TC-STUDENTSIM (Phase 1, all)
 **Read ALL instructions first** before executing. Understand teaching intent — intentional errors, progressive disclosure, and troubleshooting exercises are not bugs.
+
+**Intentional vs unintentional errors:** Before reporting a bug, determine if the error is deliberate:
+
+| Signal | Intentional (not a bug) | Unintentional (real bug) |
+|--------|------------------------|--------------------------|
+| Course book | Says "troubleshoot", "debug", "fix the error" | Says "run this" / "this should work" |
+| Objectives | Include "identify and correct" | No mention of troubleshooting |
+| Guidance | Hints provided for resolution | No debugging path given |
+| Student path | Can recover using provided hints | Stuck with no way forward |
+
+If the exercise objective includes troubleshooting and the course book explicitly references the error, document it as INTENTIONAL and verify the hints are sufficient. Only report as a bug if the student has no reasonable path to resolution.
 
 Execute step by step, translating each instruction:
 - Commands → `ssh_tool.py run` or `devcontainer-run`
@@ -164,6 +196,11 @@ Prefer `oc` CLI > `curl` > REST API > Playwright (in that order). Application no
 
 ### TC-CLEAN (Phase 1, all)
 `lab finish` → `lab start` (re-start check) → `lab finish`. Re-start failure = P1 incomplete cleanup. 404 on deleting resources from other exercises is expected in progressive courses.
+
+**Rollback resilience checks** (run if time permits):
+- **Finish without start**: `lab finish` on a not-started exercise should exit gracefully, not crash (traceback/exception = P1)
+- **Double start**: `lab start` twice should handle gracefully — crash = P1, "already started" message = OK
+- **Grade doesn't corrupt state**: After `lab grade`, `lab finish` and `lab start` should still work — failure = P1
 
 ### TC-SOL (Phase 2, if solutions exist)
 Fresh start → copy solutions → run playbooks → verify/grade → finish. Solutions don't work = P1.
@@ -259,6 +296,20 @@ ssh_tool.py run "podman pull --tls-verify=false <registry>/<image>:<tag>"
 | **P3** | Polish (typos, style, naming inconsistency) | Optional |
 | **LAB** | Lab infrastructure (slow start, transient failures, 404 on cleanup) | Report to lab/platform team |
 | **ENV** | Environment (version mismatch, disk full, cluster not ready) | Report to operations |
+
+### Bug Types
+
+Bugs have both a severity (P0-P3) and a type. Include the type in bug IDs when applicable.
+
+| Type | Description | Example |
+|------|-------------|---------|
+| **TECH** | Technical failure (default) | File not found, syntax error, service fails |
+| **PEDAGOGY** | Solution contradicts teaching | Course teaches `copy` module, solution uses `template` |
+| **SEQUENCE** | Exercise uses concepts not yet taught | Vault used in Ch.2 but taught in Ch.5 |
+| **COMPLEXITY** | Exercise scope exceeds stated objective | Objective says "learn variables", exercise adds roles + vault + handlers |
+| **GUIDANCE** | Intentional error lacks sufficient hints | "Fix the error" with no indication of where to look |
+
+Format: `BUG-<TYPE>-NNN` (e.g., `BUG-PEDAGOGY-001`). Use `TECH` for standard technical bugs. Pedagogical types are typically P2 unless they block the student (then P0/P1).
 
 ### Decision Tree
 1. Student can't complete exercise? → **P0**

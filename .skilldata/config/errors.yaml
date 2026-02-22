@@ -132,6 +132,36 @@
   title: Execution Environment Pull Failed
   fix: "Check registry access and image name. Try `podman pull <image>` manually."
 
+# Service failures
+- id: service_start_failed
+  regex: "(Unable to start service|Job for \\S+\\.service failed|Failed with result 'exit-code'|Failed to start \\S+)"
+  category: Service failure
+  severity: P1
+  title: Service Start Failed
+  fix: "Check config syntax (e.g., `nginx -t`), port conflicts (`ss -tuln | grep <port>`), SELinux denials (`ausearch -m avc -ts recent`), and file permissions on config files."
+
+# Pedagogical / Course Patterns
+- id: solution_mismatch
+  regex: "(solution|\.sol).*(different|doesn't match|does not match|mismatch|alternative).*(course|book|chapter|teaching|instruction)"
+  category: Pedagogical
+  severity: P2
+  title: Solution Doesn't Match Teaching Approach
+  fix: "Compare the solution approach with the course book instruction. If the solution uses a different module/method than taught, report as BUG-PEDAGOGY."
+
+- id: file_path_subdirectory
+  regex: "(Could not find or access|No such file or directory).*(files/|templates/|../)"
+  category: Path resolution
+  severity: P1
+  title: Relative Path Incorrect from Execution Context
+  fix: "Check if the playbook runs from a subdirectory. Relative paths like 'files/x' may need '../files/x' depending on execution context."
+
+- id: missing_prerequisite_step
+  regex: "(no such user|unknown user|group .* does not exist|No such file or directory)"
+  category: Missing prerequisite
+  severity: P0
+  title: Prerequisite Not Created by Prior Step
+  fix: "Check if a previous step or lab script should have created this user/group/file. If not mentioned in course book, report as BUG-TECH."
+
 # Generic
 - id: permission_denied
   regex: "(Permission denied|Operation not permitted|requires root)"
