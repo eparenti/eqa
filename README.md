@@ -73,10 +73,10 @@ eqa/
 
 | Phase | What | When |
 |-------|------|------|
-| **0: Static** | TC-EXEC, TC-INSTRUCT, TC-SECURITY, TC-STATICDIFF | Always |
-| **1: Simulate** | TC-PREREQ, TC-GRADE, TC-STUDENTSIM, TC-LIVEDIFF, TC-WEB, TC-CLEAN | Always |
-| **2: Solutions** | TC-SOL, TC-SOLVE | If solutions exist |
-| **3: Idempotency** | TC-IDEM | If Phase 1 passed |
+| **0: Static** | TC-EXEC, TC-INSTRUCT, TC-SECURITY, TC-STATICDIFF | Runs concurrently with lab start |
+| **1: Simulate** | TC-PREREQ, TC-GRADE, TC-STUDENTSIM, TC-LIVEDIFF, TC-WEB | Always |
+| **2+CLEAN** | TC-CLEAN + TC-SOL (merged), TC-SOLVE | If solutions exist |
+| **3: Idempotency** | TC-IDEM | Satisfied by Phase 2 |
 
 ## Test Categories
 
@@ -86,15 +86,14 @@ eqa/
 | TC-INSTRUCT | 0 | Instruction completeness, accuracy, clarity |
 | TC-SECURITY | 0 | Hardcoded credentials, insecure patterns, permissions |
 | TC-STATICDIFF | 0 | EPUB file content vs solution files, complexity alignment, grading coverage |
-| TC-PREREQ | 1 | Lab start works, environment ready |
+| TC-PREREQ | 1 | `lab finish` then `lab start` (guarantees clean state); initial state verification |
 | TC-GRADE | 1 | Grading validates correctly (Labs only) |
 | TC-STUDENTSIM | 1 | EPUB instructions execute correctly (incl. verification steps) |
 | TC-LIVEDIFF | 1 | Student-created files vs solution files (live comparison) |
 | TC-WEB | 1 | Web app/console accessibility |
-| TC-CLEAN | 1 | Cleanup complete, re-start works, rollback resilience |
-| TC-SOL | 2 | Solution files produce correct state |
-| TC-SOLVE | 2 | `lab solve` produces correct state |
-| TC-IDEM | 3 | Consistent results across cycles |
+| TC-CLEAN + TC-SOL | 2+CLEAN | Merged: `lab finish → lab start` proves cleanup; same fresh env used for solution testing |
+| TC-SOLVE | 2+CLEAN | `lab solve` produces correct state (replaces TC-SOL when solve is available) |
+| TC-IDEM | 3 | Phase 2 counts as cycle 2; differing results = P1 state pollution |
 
 ## Bug Classification
 
