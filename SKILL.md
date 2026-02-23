@@ -36,22 +36,21 @@ All example values in this document are **illustrative** — extract real values
 
 Run these steps in order when invoked.
 
-### 1. Resolve → 2. Parse → 3. Connect → 4. Profile
+### 1. Resolve → 2. Parse + Connect (parallel) → 3. Profile
 
 ```bash
-# 1. Resolve course input
+# 1. Resolve course input (sequential — outputs feed steps 2+3)
 course_tool.py resolve <input> [--chapter N]
 # Returns: {epub_path, lesson_path, lesson_code, lab_framework}
 
-# 2. Parse EPUB
+# 2a. Parse EPUB  } Run these two in parallel — they don't depend on each other
+# 2b. Connect SSH }
 epub_tool.py parse <epub_path> --lesson-path <lesson_path>
 # Returns: {exercises, extract_dir, ...}
-
-# 3. Connect SSH
 ssh_tool.py connect --host workstation
 # Returns: {framework, capabilities, lab_cli_version, ...}
 
-# 4. Build course profile (use extract_dir from step 2, NOT the repo directory)
+# 3. Build course profile (use extract_dir from step 2a, NOT the repo directory)
 profile_tool.py build <extract_dir>
 # Returns: {uses_dev_containers, uses_ansible_navigator, real_hosts, ...}
 ```
@@ -91,27 +90,35 @@ ssh_tool.py status              # Get subnets
 
 ### Phase Overview
 
-| Phase | What | Applies to |
-|-------|------|-----------|
-| **0: Static** | TC-EXEC, TC-INSTRUCT, TC-SECURITY, TC-STATICDIFF | All (STATICDIFF: if solutions exist) |
-| **1: Simulate** | TC-PREREQ → TC-GRADE pre → TC-STUDENTSIM → TC-GRADE post → TC-WEB → TC-LIVEDIFF → TC-CLEAN | All |
-| **2: Solutions** | TC-SOL and/or TC-SOLVE | If solution files or solve cmd exist |
-| **3: Idempotency** | TC-IDEM | If Phase 1 passed |
+| Phase | What | Applies to | When |
+|-------|------|-----------|------|
+| **0: Static** | TC-EXEC, TC-INSTRUCT, TC-SECURITY, TC-STATICDIFF | All (STATICDIFF: if solutions exist) | Overlaps with lab start |
+| **1: Simulate** | TC-PREREQ (finish+start) → TC-GRADE pre → TC-STUDENTSIM → TC-GRADE post → TC-WEB → TC-LIVEDIFF | All | After lab start completes |
+| **2+CLEAN: Solutions** | TC-CLEAN + TC-SOL (merged) and/or TC-SOLVE | If solutions or solve exist | Immediately after Phase 1 |
+| **3: Idempotency** | TC-IDEM | If Phase 1 passed | Satisfied by Phase 2 |
 
 ### GE Checklist
 ```
-Phase 0: TC-EXEC → TC-INSTRUCT → TC-SECURITY → TC-STATICDIFF (if solutions)
-Phase 1: lab start → student sim (incl. verification) → live diff → lab finish → re-start → lab finish
-Phase 2: lab start → apply solutions → run playbooks → verify → lab finish
-Phase 3: compare Phase 1 vs Phase 2 (or repeat Phase 1)
+Setup:    resolve → (parse + connect in parallel) → profile → install lab package
+          ↓ immediately kick off: lab finish (safety) + lab start [background if possible]
+Phase 0:  TC-EXEC → TC-INSTRUCT → TC-SECURITY → TC-STATICDIFF   ← runs while lab starts
+          ↓ wait for lab start; verify initial state
+Phase 1:  student sim (incl. verification, parallel playbooks) → live diff
+Phase 2+CLEAN: lab finish → lab start [clean-state check = TC-CLEAN; fresh env = TC-SOL]
+               → verify initial state → apply solutions → run → verify → lab finish
+Phase 3:  TC-IDEM satisfied (Phase 2 = cycle 2)
 ```
 
 ### Lab Checklist
 ```
-Phase 0: TC-EXEC → TC-INSTRUCT → TC-SECURITY → TC-STATICDIFF
-Phase 1: lab start → grade (expect FAIL) → student sim → grade (expect PASS) → live diff → lab finish → re-start → lab finish
-Phase 2: lab start → apply solutions → grade (expect PASS) → lab finish
-Phase 3: compare Phase 1 vs Phase 2 (or repeat Phase 1)
+Setup:    resolve → (parse + connect in parallel) → profile → install lab package
+          ↓ immediately kick off: lab finish (safety) + lab start [background if possible]
+Phase 0:  TC-EXEC → TC-INSTRUCT → TC-SECURITY → TC-STATICDIFF   ← runs while lab starts
+          ↓ wait for lab start; verify initial state
+Phase 1:  grade (expect FAIL) → student sim → grade (expect PASS) → live diff
+Phase 2+CLEAN: lab finish → lab start [clean-state check = TC-CLEAN; fresh env = TC-SOL]
+               → verify initial state → apply solutions → grade (expect PASS) → lab finish
+Phase 3:  TC-IDEM satisfied (Phase 2 = cycle 2)
 ```
 
 Collect ALL bugs before reporting (don't fail-fast). Exception: P0 blockers may stop testing early.
@@ -152,7 +159,14 @@ Static comparison of EPUB file content against solution files. Diff each file_ac
 - **Grading coverage gaps** (Labs): Extract `dest`/`path` from solution copy/template/file tasks and `name` from service/systemd tasks. If the grading script doesn't verify a solution-created resource, flag as P3.
 
 ### TC-PREREQ (Phase 1, all)
-Run `ssh_tool.py lab start <exercise>`. Auto-recovery handles blocking labs. If `success: false` → P0. Verify SSH to managed hosts.
+Always run `lab finish` before `lab start` to guarantee a clean environment regardless of leftover state from prior testing:
+
+```bash
+ssh_tool.py lab finish <exercise>   # safe even if not started; clears any leftover state
+ssh_tool.py lab start <exercise>    # fresh start
+```
+
+If `lab start` returns `success: false` → P0. After start, verify the exercise directory matches the expected initial state (spot-check a key file against the materials directory). If the state doesn't match what the instructions assume, record the discrepancy — it may indicate a bug in the start script. Verify SSH to managed hosts.
 
 ### TC-GRADE (Phase 1, Labs only)
 **Exit codes don't indicate pass/fail** — read the `checks` array or `stdout` directly.
@@ -182,6 +196,12 @@ Execute step by step, translating each instruction:
 
 **Verification steps (GEs):** Steps marked `is_verification: true` are part of the exercise flow — execute them inline during simulation. Failure after correct preceding steps = P1. Report verification results as a subsection (e.g., "Verification: 4/4 checks passed").
 
+**Parallel playbooks:** When playbooks target independent host groups (e.g., `ios` vs `junos`, or different managed hosts with no shared state), run them simultaneously using multiple Bash tool calls in the same message. This can cut playbook execution time by 50% or more. Limit to 4 concurrent SSH sessions — more than that saturates the SSH multiplexer and causes connection failures.
+
+**Parallel verifications:** Run verification/auxiliary playbooks in a parallel batch the same way, respecting the 4-session limit.
+
+**Parallel file uploads:** Use background shell (`&` + `wait`) to upload multiple files simultaneously. Keep batches to 4–6 files at a time to avoid saturating the SSH mux.
+
 **Dev containers:** `devcontainer-start` → pre-pull EE → `devcontainer-run` for commands → `lab` commands on workstation → let `lab finish` handle cleanup.
 
 **Network devices:** Apply 2x timeout multiplier. Expect 90-110s for lab start/finish.
@@ -194,19 +214,27 @@ After TC-STUDENTSIM completes, compare each student-created file against its cor
 ### TC-WEB (Phase 1, if web apps/consoles)
 Prefer `oc` CLI > `curl` > REST API > Playwright (in that order). Application not reachable = P1.
 
-### TC-CLEAN (Phase 1, all)
-`lab finish` → `lab start` (re-start check) → `lab finish`. Re-start failure = P1 incomplete cleanup. 404 on deleting resources from other exercises is expected in progressive courses.
+### TC-CLEAN + TC-SOL (merged, Phases 1+2)
+**Run these together to avoid an extra lab start/finish cycle** — the re-start check that proves TC-CLEAN is the same fresh environment TC-SOL needs anyway.
 
-**Rollback resilience checks** (run if time permits):
-- **Finish without start**: `lab finish` on a not-started exercise should exit gracefully, not crash (traceback/exception = P1)
+```
+lab finish          ← Phase 1 teardown; re-start check begins here
+lab start           ← proves cleanup was complete (TC-CLEAN); also TC-SOL fresh env
+verify initial state
+apply solutions
+run playbooks / grade
+verify / grade
+lab finish          ← TC-SOL teardown
+```
+
+Re-start failure = P1 incomplete cleanup. Solutions don't work = P1. 404 on deleting resources from other exercises is expected in progressive courses.
+
+**Rollback resilience checks** (run if time permits, before applying solutions):
 - **Double start**: `lab start` twice should handle gracefully — crash = P1, "already started" message = OK
 - **Grade doesn't corrupt state**: After `lab grade`, `lab finish` and `lab start` should still work — failure = P1
 
-### TC-SOL (Phase 2, if solutions exist)
-Fresh start → copy solutions → run playbooks → verify/grade → finish. Solutions don't work = P1.
-
-### TC-SOLVE (Phase 2, if solve available)
-Fresh start → `ssh_tool.py lab solve <exercise>` → verify/grade → finish.
+### TC-SOLVE (Phase 2, if solve available — no separate TC-SOL)
+Folded into the merged TC-CLEAN+TC-SOL cycle: after lab start, run `ssh_tool.py lab solve <exercise>` instead of copying solution files, then verify/grade → finish.
 
 ### TC-IDEM (Phase 3, if Phase 1 passed)
 **Shortcut:** If TC-SOL passed, it counts as cycle 2. Different results = P1 state pollution.
@@ -235,10 +263,24 @@ Fresh start → `ssh_tool.py lab solve <exercise>` → verify/grade → finish.
 ssh_tool.py write-file /home/student/<ex>/file.yml --content "$(base64 -w0 /tmp/file.yml)"
 ```
 
+### Background Lab Start (TC-PREREQ)
+Use `run_in_background: true` on the Bash tool to kick off the lab cycle while Phase 0 runs:
+```bash
+# Kick off in background — note the output file path returned in the tool result
+python3 ssh_tool.py lab finish <exercise> && python3 ssh_tool.py lab start <exercise>
+# [run Phase 0 static analysis here while this runs]
+# Then read the result:
+cat <output_file>   # or use the TaskOutput tool with the background task ID
+```
+Check `success` in the lab start JSON before proceeding. If the background task ID is lost, `ssh_tool.py run "lab -v"` confirms whether the lab is running.
+
 ### Applying Solutions (TC-SOL)
 ```bash
-ssh_tool.py run "cp /home/student/<ex>/solutions/playbook.yml.sol /home/student/<ex>/playbook.yml"
+# Preferred: solutions/ subdirectory is always present inside the exercise dir after lab start
 ssh_tool.py run "cp -r /home/student/<ex>/solutions/group_vars /home/student/<ex>/"
+ssh_tool.py run "cp /home/student/<ex>/solutions/playbook.yml /home/student/<ex>/playbook.yml"
+# Alternative: copy from grading package (use when solutions/ dir isn't available)
+ssh_tool.py run "cp /path/to/grading/materials/labs/<ex>/solutions/playbook.yml /home/student/<ex>/"
 ```
 
 ### Dev Container Lifecycle
@@ -333,7 +375,10 @@ Format: `BUG-<TYPE>-NNN` (e.g., `BUG-PEDAGOGY-001`). Use `TECH` for standard tec
 - **Coverage**: exercises tested / total
 - **Defect density**: bugs per exercise (target: < 0.5)
 - **Critical ratio**: P0+P1 as % of total (target: < 20%)
-- **Performance budgets**: lab start > 60s, lab finish > 60s, total > 10min → flag
+- **Performance budgets** (use tool-reported `duration` values, not wall-clock time — wall clock includes LLM processing and will always be inflated when running interactively):
+  - lab start > 120s → flag as LAB (normal: 60–110s; network device courses: up to 120s)
+  - lab finish > 90s → flag as LAB (normal: 30–55s)
+  - Total lab operation time (sum of all tool durations) > 10min → flag
 
 ### Quality Score (0-100, via `report_tool.py score`)
 | Score | Assessment |
@@ -361,6 +406,8 @@ Include: Summary, Quality Metrics, Test Results (by phase/TC), Bugs Found, Lab I
 - Blocking lab → ssh_tool auto-recovers. If not, `ssh_tool.py lab finish <exercise>` manually.
 - Command timeout → retry once with 2x timeout, then P2.
 - SSH drops → ssh_tool auto-reconnects. If not, `ssh_tool.py connect` again.
+- **SSH host key changed** → the environment was *reprovisioned*, not just a transient drop. Clear the stale entry (`ssh-keygen -R <host>`), reconnect, and flag any timing data collected before the reprovision as unreliable. This is an **ENV** issue.
+- `lab finish` takes much longer than usual (e.g., 500s vs normal 40s) → VMs rebooted after a reprovision and are slow to respond; not a course bug. **ENV**.
 - Grade passes without solution → P1 (grading SHOULD fail without student work).
 - `lab install` blocked → use `lab force` (DL5) or check `lab select` (DL4).
 - Multi-repo course → `lab install <new-lesson>` before switching lessons.
